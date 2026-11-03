@@ -53,21 +53,25 @@ def compute_symmetric_states(
         # since we have 4 different symmetries, we need to augment the batch size by 4
         obs_aug = obs.repeat(4)
 
-        # policy observation group
-        # -- original
-        obs_aug["policy"][:batch_size] = obs["policy"][:]
-        # -- left-right
-        obs_aug["policy"][batch_size : 2 * batch_size] = _transform_policy_obs_left_right(
-            env.unwrapped, obs["policy"], joint_names
-        )
-        # -- front-back
-        obs_aug["policy"][2 * batch_size : 3 * batch_size] = _transform_policy_obs_front_back(
-            env.unwrapped, obs["policy"], joint_names
-        )
-        # -- diagonal
-        obs_aug["policy"][3 * batch_size :] = _transform_policy_obs_front_back(
-            env.unwrapped, obs_aug["policy"][batch_size : 2 * batch_size], joint_names
-        )
+        for group_name in ("actor_obs", "critic_base_obs", "privileged_obs"):
+            if group_name not in obs:
+                continue
+            group_obs = obs[group_name]
+            height_scan = "height_scan" in env.unwrapped.observation_manager.active_terms[group_name]
+            left_right_perm, left_right_sign = _observation_symmetry(
+                "left_right", group_name, group_obs.shape[1], height_scan, joint_names, str(group_obs.device)
+            )
+            front_back_perm, front_back_sign = _observation_symmetry(
+                "front_back", group_name, group_obs.shape[1], height_scan, joint_names, str(group_obs.device)
+            )
+            # -- left-right
+            obs_aug[group_name][batch_size : 2 * batch_size] = group_obs[:, left_right_perm] * left_right_sign
+            # -- front-back
+            obs_aug[group_name][2 * batch_size : 3 * batch_size] = group_obs[:, front_back_perm] * front_back_sign
+            # -- diagonal
+            obs_aug[group_name][3 * batch_size :] = (
+                obs_aug[group_name][batch_size : 2 * batch_size][:, front_back_perm] * front_back_sign
+            )
     else:
         obs_aug = None
 
@@ -90,58 +94,6 @@ def compute_symmetric_states(
         actions_aug = None
 
     return obs_aug, actions_aug
-
-
-"""
-Symmetry functions for observations.
-"""
-
-
-def _transform_policy_obs_left_right(
-    env: ManagerBasedRLEnv, obs: torch.Tensor, joint_names: tuple[str, ...]
-) -> torch.Tensor:
-    """Apply a left-right symmetry transformation to the observation tensor.
-
-    This function modifies the given observation tensor by applying transformations
-    that represent a symmetry with respect to the left-right axis. This includes
-    negating certain components of the linear and angular velocities, projected gravity,
-    velocity commands, and flipping the joint positions, joint velocities, and last actions
-    for the ANYmal robot. Additionally, if height-scan data is present, it is flipped
-    along the relevant dimension.
-
-    Args:
-        env: The environment instance from which the observation is obtained.
-        obs: The observation tensor to be transformed.
-        joint_names: The robot's joint names, in the order of the joint observations.
-
-    Returns:
-        The transformed observation tensor with left-right symmetry applied.
-    """
-    perm, sign = _policy_obs_symmetry("left_right", obs.shape[1], _has_height_scan(env), joint_names, str(obs.device))
-    return obs[:, perm] * sign
-
-
-def _transform_policy_obs_front_back(
-    env: ManagerBasedRLEnv, obs: torch.Tensor, joint_names: tuple[str, ...]
-) -> torch.Tensor:
-    """Applies a front-back symmetry transformation to the observation tensor.
-
-    This function modifies the given observation tensor by applying transformations
-    that represent a symmetry with respect to the front-back axis. This includes negating
-    certain components of the linear and angular velocities, projected gravity, velocity commands,
-    and flipping the joint positions, joint velocities, and last actions for the ANYmal robot.
-    Additionally, if height-scan data is present, it is flipped along the relevant dimension.
-
-    Args:
-        env: The environment instance from which the observation is obtained.
-        obs: The observation tensor to be transformed.
-        joint_names: The robot's joint names, in the order of the joint observations.
-
-    Returns:
-        The transformed observation tensor with front-back symmetry applied.
-    """
-    perm, sign = _policy_obs_symmetry("front_back", obs.shape[1], _has_height_scan(env), joint_names, str(obs.device))
-    return obs[:, perm] * sign
 
 
 """
@@ -201,21 +153,20 @@ or ``KFE`` (knee flexion/extension). The joint order of the articulation depends
 Each transform is a column permutation and a sign per column: ``out[:, i] = sign[i] * x[:, perm[i]]``.
 """
 
-# signs of the base lin vel, ang vel, projected gravity, and velocity command columns
-_BASE_SIGNS = {
-    "left_right": (1, -1, 1, -1, 1, -1, 1, -1, 1, 1, -1, -1),
-    "front_back": (-1, 1, 1, 1, -1, -1, -1, 1, 1, -1, 1, -1),
+# signs of the angular velocity, projected gravity, and velocity command columns
+_PROPRIOCEPTIVE_SIGNS = {
+    "left_right": (-1, 1, -1, 1, -1, 1, 1, -1, -1),
+    "front_back": (1, -1, -1, -1, 1, 1, -1, 1, -1),
+}
+_LINEAR_VELOCITY_SIGNS = {
+    "left_right": (1, -1, 1),
+    "front_back": (-1, 1, 1),
 }
 # side and end letters swapped, and joint types negated, per transform
 _JOINT_SWAPS = {"left_right": str.maketrans("LR", "RL"), "front_back": str.maketrans("FH", "HF")}
 _NEGATED_JOINTS = {"left_right": ("HAA",), "front_back": ("HFE", "KFE")}
 # height-scan grid dimension flipped per transform, for the (11, 17) grid
 _HEIGHT_SCAN_FLIP_DIM = {"left_right": 0, "front_back": 1}
-
-
-def _has_height_scan(env: ManagerBasedRLEnv) -> bool:
-    """Whether the policy observation contains the height scan."""
-    return "height_scan" in env.observation_manager.active_terms["policy"]
 
 
 def _joint_permutation(kind: str, joint_names: tuple[str, ...]) -> tuple[list[int], list[float]]:
@@ -233,22 +184,30 @@ def _joint_symmetry(kind: str, joint_names: tuple[str, ...], device: str) -> tup
 
 
 @functools.cache
-def _policy_obs_symmetry(
-    kind: str, num_obs: int, height_scan: bool, joint_names: tuple[str, ...], device: str
+def _observation_symmetry(
+    kind: str,
+    group_name: str,
+    num_obs: int,
+    height_scan: bool,
+    joint_names: tuple[str, ...],
+    device: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Column permutation and signs of a transform over the policy observation, cached per joint order and device."""
+    """Cached column permutation and signs for proprioceptive or privileged observations."""
     perm = list(range(num_obs))
     sign = [1] * num_obs
-    sign[:12] = _BASE_SIGNS[kind]
-    # joint positions, joint velocities, and last actions
-    joint_perm, joint_sign = _joint_permutation(kind, joint_names)
-    for start in (12, 24, 36):
-        perm[start : start + 12] = [start + joint for joint in joint_perm]
-        sign[start : start + 12] = joint_sign
-    # note: this is hard-coded for grid-pattern of ordering "xy" and size (1.6, 1.0)
-    if height_scan:
-        grid = torch.arange(48, 235).view(11, 17).flip(dims=[_HEIGHT_SCAN_FLIP_DIM[kind]])
-        perm[48:235] = grid.flatten().tolist()
+    if group_name == "privileged_obs":
+        sign[:3] = _LINEAR_VELOCITY_SIGNS[kind]
+        # note: this is hard-coded for grid-pattern of ordering "xy" and size (1.6, 1.0)
+        if height_scan:
+            grid = torch.arange(3, 190).view(11, 17).flip(dims=[_HEIGHT_SCAN_FLIP_DIM[kind]])
+            perm[3:190] = grid.flatten().tolist()
+    else:
+        sign[:9] = _PROPRIOCEPTIVE_SIGNS[kind]
+        # joint positions, joint velocities, and last actions
+        joint_perm, joint_sign = _joint_permutation(kind, joint_names)
+        for start in (9, 21, 33):
+            perm[start : start + 12] = [start + joint for joint in joint_perm]
+            sign[start : start + 12] = joint_sign
     return (
         torch.tensor(perm, dtype=torch.long, device=device),
         torch.tensor(sign, device=device),

@@ -49,7 +49,7 @@ from . import mdp
 
 @configclass
 class RoughPhysicsCfg(PresetCfg):
-    """Shared backend presets for locomotion velocity environments."""
+    """목표 속도 추종 목적을 위한 물리 백엔드 설정 모음 클래스(PhysX + MJWarp)"""
 
     isaacsim_physx = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
     ovphysx = OvPhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
@@ -79,7 +79,7 @@ class RoughPhysicsCfg(PresetCfg):
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
-    """Configuration for the terrain scene with a legged robot."""
+    """로봇 플랫폼, 지형 세부 내용 및 센서에 대한 설정"""
 
     # ground terrain
     terrain = TerrainImporterCfg(
@@ -137,13 +137,18 @@ class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.05,     
+        rel_rotating_envs=0.05,
         rel_heading_envs=1.0,
-        heading_command=True,
+        heading_command=False,
         heading_control_stiffness=0.5,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+            lin_vel_x=(-2.0, 2.0), 
+            lin_vel_y=(-1.0, 1.0), 
+            ang_vel_z=(-3.0, 3.0), 
+            # heading=(-math.pi, math.pi)
+            # height_offset=(-0.06, 0.06) --- 추후 개발 예정 ---
         ),
     )
 
@@ -157,14 +162,13 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP."""
+    """속도 추종 환경에서 공통으로 사용하는 actor, critic 기본 관측, 특권 관측 그룹."""
 
     @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+    class ActorObsCfg(ObsGroup):
+        """학습 시 센서 노이즈를 적용하는 actor의 기본 관측 입력."""
 
-        # observation terms (order preserved)
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
+        # 관측 항목의 선언 순서가 정책에 전달되는 입력 순서를 결정한다.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
@@ -174,6 +178,28 @@ class ObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
         actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True  # 해당 관측 그룹에 설정된 노이즈를 적용하는 스위치
+            self.concatenate_terms = True  # 관측 항목을 하나의 입력 벡터로 이어 붙이는 스위치
+
+    @configclass
+    class CriticBaseObsCfg(ActorObsCfg):
+        """Actor와 동일한 기본 관측 항목을 관측 노이즈 없이 계산한다."""
+
+        def __post_init__(self):
+            super().__post_init__()
+            self.enable_corruption = False
+
+    @configclass
+    class PrivilegedObsCfg(ObsGroup):
+        """관측 노이즈가 없는 몸통 좌표계 선속도와 지형 높이.
+
+        평지 환경에서는 ``height_scan = None``으로 설정한다.
+        높이 스캔을 제외해도 선속도 3차원이 남으므로 관측 그룹이 비지 않는다.
+        """
+
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         height_scan = ObsTerm(
             func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
@@ -182,11 +208,13 @@ class ObservationsCfg:
         )
 
         def __post_init__(self):
-            self.enable_corruption = True
+            self.enable_corruption = False
             self.concatenate_terms = True
 
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
+    # 최종 critic 입력은 RL runner가 기본 관측과 특권 관측을 순서대로 연결한다.
+    actor_obs: ActorObsCfg = ActorObsCfg()
+    critic_base_obs: CriticBaseObsCfg = CriticBaseObsCfg()
+    privileged_obs: PrivilegedObsCfg = PrivilegedObsCfg()
 
 
 @configclass
@@ -283,29 +311,26 @@ class RewardsCfg:
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
+
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time,
-        weight=0.125,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
-            "command_name": "base_velocity",
-            "threshold": 0.5,
-        },
-    )
-    undesired_contacts = RewTerm(
+
+    collisions = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*THIGH"), "threshold": 1.0},
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]), 
+                "threshold": 1.0,
+        },
     )
+    
     # -- optional penalties
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+
 
 
 @configclass
@@ -326,44 +351,52 @@ class CurriculumCfg:
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
 
 
-##
-# Environment configuration
-##
+
+
+
+
+## ====================================================================================
+# 기본 환경 설정 클래스 : LocomotionVelocityRoughEnvCfg
+## ====================================================================================
 
 
 @configclass
 class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
-    """Configuration for the locomotion velocity-tracking environment."""
+    """ 목표속도를 따라 걷는 강화학습 환경의 기본 설정 (locomotion : 전후·좌우 이동과 회전)"""
 
-    # Simulation settings
+    # Simulation settings — 공유 물리 백엔드 프리셋
     sim: SimulationCfg = SimulationCfg(physics=RoughPhysicsCfg())
-    # Scene settings
+
+    # Scene settings : 로봇 플랫폼, 로봇 환경 수, 환경 간 배치 간격 등 
     scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
-    # Basic settings
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: ActionsCfg = ActionsCfg()
-    commands: CommandsCfg = CommandsCfg()
+
+    # Basic settings : 입출력, 목표 관리
+    observations: ObservationsCfg = ObservationsCfg()   # 정책 입력 관리
+    actions: ActionsCfg = ActionsCfg()  # 정책 출력 관리
+    commands: CommandsCfg = CommandsCfg()   # 목표 속도명령 관리
+
     # MDP settings
     rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
-    events: EventsCfg = EventsCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    terminations: TerminationsCfg = TerminationsCfg()   # 에피소드 종료 조건 관리
+    events: EventsCfg = EventsCfg()     # 도메인 랜덤화 이벤트 관리
+    curriculum: CurriculumCfg = CurriculumCfg()     # 학습 성과에 따른 지형 난이도 조절
+
 
     def __post_init__(self):
-        """Post initialization."""
+        """ 설정한 객체 생성한 이후 세부값 조정 """
         # general settings
-        self.decimation = 4
+        self.decimation = 4     # 정책 행동을 4step마다 한 번씩 업데이트
         self.episode_length_s = 20.0
         # simulation settings
-        self.sim.dt = 0.005
+        self.sim.dt = 0.005     # 물리 시뮬레이션의 업데이트 주기
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        # update sensor update periods
-        # we tick all the sensors based on the smallest update period (physics update period)
+        
+        # update sensor update periods : 물리 시뮬레이션 업데이트 기준
         if self.scene.height_scanner is not None:
-            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+            self.scene.height_scanner.update_period = self.decimation * self.sim.dt     # 0.02 s
         if self.scene.contact_forces is not None:
-            self.scene.contact_forces.update_period = self.sim.dt
+            self.scene.contact_forces.update_period = self.sim.dt       # 0.005 s
 
         # check if terrain levels curriculum is enabled - if so, enable curriculum for terrain generator
         # this generates terrains with increasing difficulty and is useful for training
@@ -375,7 +408,7 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
                 self.scene.terrain.terrain_generator.curriculum = False
 
     def play_mode(self):
-        """Play-mode overrides shared by the velocity-tracking environments."""
+        """ 학습된 정책을 실행할 때의 환경 설정 """
         super().play_mode()
         # spawn the robot randomly in the grid (instead of their terrain levels)
         self.scene.terrain.max_init_terrain_level = None

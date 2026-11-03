@@ -61,6 +61,12 @@ class UniformVelocityCommand(CommandTerm):
         super().__init__(cfg, env)
 
         # check configuration
+        if not 0.0 <= self.cfg.rel_standing_envs <= 1.0:
+            raise ValueError("rel_standing_envs must be in [0, 1].")
+        if not 0.0 <= self.cfg.rel_rotating_envs <= 1.0:
+            raise ValueError("rel_rotating_envs must be in [0, 1].")
+        if self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs > 1.0:
+            raise ValueError("rel_standing_envs + rel_rotating_envs must be <= 1.")
         if self.cfg.heading_command and self.cfg.ranges.heading is None:
             raise ValueError(
                 "The velocity command has heading commands active (heading_command=True) but the `ranges.heading`"
@@ -82,6 +88,7 @@ class UniformVelocityCommand(CommandTerm):
         self.heading_target = torch.zeros(self.num_envs, device=self.device)
         self.is_heading_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.is_standing_env = torch.zeros_like(self.is_heading_env)
+        self.is_rotating_env = torch.zeros_like(self.is_heading_env)
         # -- metrics: finalized per-episode means/rates, written at reset() and read by the base class
         self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
@@ -170,16 +177,23 @@ class UniformVelocityCommand(CommandTerm):
             self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
             # update heading envs
             self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
-        # update standing envs
-        self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
+        # Select mutually exclusive standing and rotating environments.
+        mode = r.uniform_(0.0, 1.0)
+        self.is_standing_env[env_ids] = mode < self.cfg.rel_standing_envs
+        self.is_rotating_env[env_ids] = (
+            (mode >= self.cfg.rel_standing_envs)
+            & (mode < self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs)
+        )
+
+        # Apply rotation constraints immediately, including after a reset.
+        if self.cfg.rel_rotating_envs > 0.0:
+            self.vel_command_b[env_ids, :2] = self.vel_command_b[env_ids, :2].masked_fill(
+                self.is_rotating_env[env_ids].unsqueeze(-1), 0.0
+            )
 
     def _update_command(self):
-        """Post-processes the velocity command.
-
-        This function sets velocity command to zero for standing environments and computes angular
-        velocity from heading direction if the heading_command flag is set.
-        """
-        # Compute angular velocity from heading direction
+        """Apply heading control and standing or rotating constraints."""
+        # Compute angular velocity from heading direction.
         if self.cfg.heading_command:
             heading_error = math_utils.wrap_to_pi(self.heading_target - self.robot.data.heading_w.torch)
             heading_ang_vel = torch.clip(
@@ -187,8 +201,17 @@ class UniformVelocityCommand(CommandTerm):
                 min=self.cfg.ranges.ang_vel_z[0],
                 max=self.cfg.ranges.ang_vel_z[1],
             )
-            self.vel_command_b[:, 2] = torch.where(self.is_heading_env, heading_ang_vel, self.vel_command_b[:, 2])
-        # Enforce standing (i.e., zero velocity command) for standing envs
+            self.vel_command_b[:, 2] = torch.where(
+                self.is_heading_env & ~self.is_rotating_env,
+                heading_ang_vel,
+                self.vel_command_b[:, 2],
+            )
+
+        # Rotating environments keep their sampled yaw velocity.
+        if self.cfg.rel_rotating_envs > 0.0:
+            index_fill_(self.vel_command_b[:, :2], self.is_rotating_env, 0.0)
+
+        # Standing environments have zero velocity in all components.
         index_fill_(self.vel_command_b, self.is_standing_env, 0.0)
 
     def _set_debug_vis_impl(self, debug_vis: bool):

@@ -14,7 +14,7 @@ class CassieRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 1500
     save_interval = 50
     experiment_name = "cassie_rough"
-    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    obs_groups = {"actor": ["actor_obs"], "critic": ["critic_base_obs", "privileged_obs"]}
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",

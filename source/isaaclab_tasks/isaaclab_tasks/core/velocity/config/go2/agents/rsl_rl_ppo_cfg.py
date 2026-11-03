@@ -10,11 +10,14 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 @configclass
 class UnitreeGo2RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24
-    max_iterations = 1500
-    save_interval = 50
+    num_steps_per_env = 24      # 24 steps로 데이터를 수집하고, 1번 PPO 학습을 수행 (24 steps + PPO학습 = 1 iteration)
+    max_iterations = 20000
+    save_interval = 100
     experiment_name = "unitree_go2_rough"
-    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    obs_groups = {
+        "actor": ["actor_obs"],
+        "critic": ["critic_base_obs", "privileged_obs"],
+    }
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
@@ -47,7 +50,7 @@ class UnitreeGo2FlatPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 300
+        self.max_iterations = 20000 # 5000
         self.experiment_name = "unitree_go2_flat"
         self.actor.hidden_dims = [128, 128, 128]
         self.critic.hidden_dims = [128, 128, 128]

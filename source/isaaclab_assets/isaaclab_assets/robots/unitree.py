@@ -151,6 +151,10 @@ UNITREE_GO1_CFG = ArticulationCfg(
 """Configuration of Unitree Go1 using MLP-based actuator model."""
 
 
+# ----------------------------------------------------------------------
+# Unitree Go2 구성
+# ----------------------------------------------------------------------
+
 UNITREE_GO2_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Robots/Unitree/Go2/go2.usd",
@@ -172,22 +176,31 @@ UNITREE_GO2_CFG = ArticulationCfg(
         ],
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.4),
+        pos=(0.0, 0.0, 0.28),
         joint_pos={
-            ".*L_hip_joint": 0.1,
-            ".*R_hip_joint": -0.1,
-            "F[L,R]_thigh_joint": 0.8,
-            "R[L,R]_thigh_joint": 1.0,
-            ".*_calf_joint": -1.5,
-        },
+            "FL_hip_joint": 0.0,         # [rad]
+            "FR_hip_joint": 0.0,         # [rad]
+            "RL_hip_joint": 0.0,         # [rad]
+            "RR_hip_joint": 0.0,         # [rad]
+
+            "FL_thigh_joint": 0.920,     # [rad] 
+            "FR_thigh_joint": 0.920,     # [rad]
+            "RL_thigh_joint": 0.920,     # [rad]
+            "RR_thigh_joint": 0.920,     # [rad]
+            
+            "FL_calf_joint": -1.850,     # [rad]
+            "FR_calf_joint": -1.850,     # [rad]
+            "RL_calf_joint": -1.850,     # [rad]
+            "RR_calf_joint": -1.850,     # [rad]
+        },                               # 초기 자세(default_dof_pos)의 결과로 나오는 높이 = 목표 높이(base_height)인 것이 좋을 것임.  
         joint_vel={".*": 0.0},
     ),
-    soft_joint_pos_limit_factor=0.9,
+    soft_joint_pos_limit_factor=0.9,    # 원래 관절 범위보다 좁은 소프트 제한 범위
     actuators={
         "base_legs": DCMotorCfg(
             joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            # the calf sits behind an extra 1.92:1 knee reduction, so its joint-side torque is
-            # higher and its joint-side speed lower than the hip and thigh. Values match ``go2.usd``.
+            # calf 관절은 1.92:1 이라는 추가 감속을 거쳐서, 다른 관절보다 더 큰 토크를 내는 대신 회전 속도가 느립니다.
+            # 따라서 calf관절은 약 1.92배 강하게 돌릴 수 있지만, 회전 속도는 약 절반이고, 이 값은 ``go2.usd``에 맞춰 적용했습니다.
             actuator_effort_limit={".*_hip_joint": 23.7, ".*_thigh_joint": 23.7, ".*_calf_joint": 45.43},
             saturation_effort={".*_hip_joint": 23.7, ".*_thigh_joint": 23.7, ".*_calf_joint": 45.43},
             actuator_velocity_limit={".*_hip_joint": 30.1, ".*_thigh_joint": 30.1, ".*_calf_joint": 15.70},
@@ -198,6 +211,9 @@ UNITREE_GO2_CFG = ArticulationCfg(
     },
 )
 """Configuration of Unitree Go2 using DC-Motor actuator model."""
+
+
+
 
 
 H1_CFG = ArticulationCfg(

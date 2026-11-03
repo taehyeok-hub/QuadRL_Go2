@@ -3,10 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Common functions that can be used to enable reward functions.
+""" 보상 항목을 구성하는 데 사용할 수 있는 Public Functions.
 
-The functions can be passed to the :class:`isaaclab.managers.RewardTermCfg` object to include
-the reward introduced by the function.
+각 함수를 isaaclab.managers.RewardTermCfg 객체에 전달하면,
+해당 함수가 계산하는 보상을 환경의 보상 항목에 포함할 수 있음.
 """
 
 from __future__ import annotations
@@ -26,72 +26,87 @@ if TYPE_CHECKING:
     from .. import ManagerBasedRLEnv
 
 """
-General.
+General-purpose rewards functions.
 """
 
 
 def is_alive(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Reward for being alive."""
+    """ 살아있을 때 주는 보상 함수. """
     return (~env.termination_manager.terminated).float()
 
 
 def is_terminated(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Penalize terminated episodes that don't correspond to episodic timeouts."""
+    """ 에피소드의 제한 시간 초과에 해당하지 않는 종료에 페널티를 부여하는 함수. --> 넘어짐 등 
+    
+    [ 실제 보상 기여분 = 함수 반환값 X weight X step_dt ] 으로 반영
+    """
     return env.termination_manager.terminated.float()
 
 
-class is_terminated_term(ManagerTermBase):
-    """Penalize termination for specific terms that don't correspond to episodic timeouts.
-
-    The parameters are as follows:
-
-    * attr:`term_keys`: The termination terms to penalize. This can be a string, a list of strings
-      or regular expressions. Default is ".*" which penalizes all terminations.
-
-    The reward is computed as the sum of the termination terms that are not episodic timeouts.
-    This means that the reward is 0 if the episode is terminated due to an episodic timeout. Otherwise,
-    if two termination terms are active, the reward is 2.
-    """
-
-    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        term_keys = cfg.params["term_keys"]
-        self._term_names = env.termination_manager.find_terms(term_keys)
-
-    def __call__(self, env: ManagerBasedRLEnv, term_keys: str | list[str] = ".*") -> torch.Tensor:
-        # Return the unweighted reward for the termination terms
-        reset_buf = torch.zeros(env.num_envs, device=env.device)
-        for term in self._term_names:
-            # Sums over terminations term values to account for multiple terminations in the same step
-            reset_buf += env.termination_manager.get_term(term)
-        return (reset_buf * (~env.termination_manager.time_outs)).float()
-
-
 def terminated_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Penalize early termination once, independently of the environment step size.
+    """ 환경의 시간 간격과 무관하게, 조기 종료 시 한 번의 고정 페널티를 부여함.
 
-    :class:`~isaaclab.managers.RewardManager` scales every term by the step interval, which would make a
-    plain terminal penalty depend on ``sim.dt`` and ``decimation``. Dividing by the step interval here
-    cancels that scaling, so the term contributes exactly its weight on the step the episode terminates. This
-    keeps the penalty equal to the fixed death cost the direct workflow applies.
+    RewardManager는 모든 보상 항목에 환경의 스텝 시간 간격을 곱해, 일반적인 종료 페널티에서는 sim.dt와 decimation에 따라 크기가 달라짐.
+
+    이 함수는 변환값을 스텝 시간간격으로 나누어서 RewardManager의 시간 배율을 상쇄함.
+    따라서 에피소드가 종료되는 스텝에서, 설정한 가중치만큼의 값이 그대로 반영됨.
+
+    [ 실제 보상 기여분 = 함수 반환값 X weight ]
     """
     return env.termination_manager.terminated.float() / env.step_dt
 
 
-class survival_success_rate(ManagerTermBase):
-    """Track episode survival as the success metric.
+class is_terminated_term(ManagerTermBase):
+    """ 에피소드 시간 초과를 제외하고, 어떤 종료 조건에 벌점을 줄지 지정하고 그 지정한 종료 조건에 페널티를 부여하는 함수.
 
-    The term returns zero reward and only tracks the metric. On episode reset it writes
-    ``Metrics/success_rate`` into ``extras["log"]``, where an episode counts as a success when it
-    timed out without terminating early.
+    매개변수:
+
+    term_keys: 페널티를 적용할 종료 조건의 이름.
+
+    문자열, 문자열 목록 또는 정규표현식으로 지정할 수 있고, 시간 초과가 발생한 경우에는 0을 반환함. 
+    그 외에는 선택한 종료 조건 중 활성화된 조건의 개수를 합산하여 반환함. 두 개의 종료조건이 동시에 활성화되면 2를 반환함.
     """
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
 
+        # 생성 시, 벌점을 줄지 대상 조건의 이름을 찾아 저장.
+        term_keys = cfg.params["term_keys"]
+        self._term_names = env.termination_manager.find_terms(term_keys)
+
+    def __call__(self, env: ManagerBasedRLEnv, term_keys: str | list[str] = ".*") -> torch.Tensor:
+        # 매 보상 계산 때는 선택한 조건들의 발생 여부를 더해서 반환.
+        reset_buf = torch.zeros(env.num_envs, device=env.device)
+        for term in self._term_names:
+            reset_buf += env.termination_manager.get_term(term)
+        # 시간 초과가 발생한 경우에는 0을 반환함. 시간 초과와 다른 실패 조건이 동시에 발생해도 0을 반환함. 
+        return (reset_buf * (~env.termination_manager.time_outs)).float()
+
+
+class survival_success_rate(ManagerTermBase):
+    """ 에피소드 생존 여부를 성공 지표로 기록하는 함수 클래스.
+
+    보상값은 항상 0을 반환하며, 지표만 기록하도록 함.
+    에피소드가 리셋될 때 extras["log"]에 Metrics/success_rate를 기록함.
+    
+    조기 종료 없이 제한 시간에 도달한 에피소드를 성공으로 간주함.
+    """
     def reset(self, env_ids: torch.Tensor) -> None:
-        survived = self._env.termination_manager.time_outs[env_ids]
+        # 에피소드가 끝나 리셋될 때 결과를 확인하고 extras["log"]에 기록함. (env_ids : 리셋되는 환경 idx)
+        survived = self._env.termination_manager.time_outs[env_ids] 
         self._env.extras.setdefault("log", {})["Metrics/success_rate"] = survived.float().mean()
 
+    # 매 보상 계산에서는 0을 반환함.
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
         return torch.zeros(env.num_envs, device=env.device)
+
+
+
+
+
+
+
+
+
 
 
 """
@@ -100,21 +115,23 @@ Root penalties.
 
 
 def lin_vel_z_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize z-axis base linear velocity using L2 squared kernel."""
+    """ 몸통좌표계의 Z축 선속도에 제곱 L2 페널티를 부여하는 함수. """
+    
+    # 로봇의 RigidObject를 가져와서, root_lin_vel_b.torch[:, 2](body 기반)를 제곱하여 반환함.
     asset: RigidObject = env.scene[asset_cfg.name]
     return torch.square(asset.data.root_lin_vel_b.torch[:, 2])
 
 
 def ang_vel_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize xy-axis base angular velocity using L2 squared kernel."""
+    """ 몸통좌표계의 XY축 각속도에 제곱 L2 페널티를 부여하는 함수. """
     asset: RigidObject = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.root_ang_vel_b.torch[:, :2]), dim=1)
 
 
 def flat_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize non-flat base orientation using L2 squared kernel.
+    """ 몸통의 평면이 아닌 방향에 대해 L2 제곱 커널을 사용하여 페널티를 부여하는 함수.
 
-    This is computed by penalizing the xy-components of the projected gravity vector.
+    이는 투영된 중력 벡터의 xy 성분을 페널티로 적용하여 계산됨.
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.projected_gravity_b.torch[:, :2]), dim=1)
@@ -126,16 +143,15 @@ def base_height_l2(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Penalize asset height from its target using L2 squared kernel.
+    """ 몸통의 높이를 목표 높이로부터 페널티를 부여하는 함수. L2 제곱 커널을 사용함.
 
     Note:
-        For flat terrain, target height is in the world frame. For rough terrain,
-        sensor readings can adjust the target height to account for the terrain.
+        평면 지형의 경우, 목표 높이는 월드 프레임에 위치함. 
+        거친 지형의 경우, 센서 읽기는 지형을 고려하여 목표 높이를 조정할 수 있음.
 
     Note:
-        A ray that hits nothing within its ``max_distance`` reports ``inf`` rather than a clamped
-        value, so only finite hits are averaged into the terrain-adjusted target height. An
-        environment whose rays all miss falls back to the unadjusted ``target_height``.
+        ``max_distance`` 내에서 아무것도 충돌하지 않는 레이는 ``inf``를 보고하여 클램핑된 값을 보고하지 않으므로, 
+        유한한 충돌만이 지형 조정된 목표 높이에 평균화됨. 모든 레이가 실패하는 환경은 조정되지 않은 ``target_height``로 돌아감.
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     if sensor_cfg is not None:
@@ -177,28 +193,26 @@ def joint_torques_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEn
 
 
 def joint_vel_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Penalize joint velocities on the articulation using an L1-kernel."""
+    """ 선택한 관절의 속도를 L1-kernal을 활용해 페널티를 계산하는 함수. """
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.abs(asset.data.joint_vel.torch[:, asset_cfg.joint_ids]), dim=1)
 
 
 def joint_vel_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize joint velocities on the articulation using L2 squared kernel.
+    """ 선택한 관절의 속도를 제곱하여 (L2-kernal을 활용해) 페널티를 계산하는 함수.
 
     .. note::
-        Only the joints configured in :attr:`asset_cfg.joint_ids` will have their joint velocities
-        contribute to the term.
+        `asset_cfg.joint_ids` 에 지정된 관절만 계산에 포함됨.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_vel.torch[:, asset_cfg.joint_ids]), dim=1)
 
 
 def joint_acc_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize joint accelerations on the articulation using L2 squared kernel.
+    """ 선택한 관절의 가속도를 제곱하여 (L2-kernal을 활용해) 페널티를 계산하는 함수.
 
     .. note::
-        Only the joints configured in :attr:`asset_cfg.joint_ids` will have their joint accelerations
-        contribute to the term.
+       `asset_cfg.joint_ids` 에 지정된 관절만 계산에 포함됨.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_acc.torch[:, asset_cfg.joint_ids]), dim=1)
@@ -313,7 +327,7 @@ def undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: Sce
 
 
 def desired_contacts(env, sensor_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
-    """Penalize if none of the desired contacts are present."""
+    """ 선택한 부위 중 접촉한 부위가 하나도 없으면 1, 하나라도 있으면 0을 반환하도록 하는 함수. """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     contacts = (
         contact_sensor.data.net_normal_forces_w_history.torch[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0]

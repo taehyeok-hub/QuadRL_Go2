@@ -33,33 +33,37 @@ class NullCommandCfg(CommandTermCfg):
 
 @configclass
 class UniformVelocityCommandCfg(CommandTermCfg):
-    """Configuration for the uniform velocity command generator."""
+    """균등 분포를 활용한 uniform velocity command generator 설정 클래스."""
 
     class_type: type["UniformVelocityCommand"] | str = "{DIR}.velocity_command:UniformVelocityCommand"
 
     asset_name: str = MISSING
-    """Name of the asset in the environment for which the commands are generated."""
+    # 명령 생성의 대상이 되는 환경 내 로봇 또는 자산의 이름. 
 
     heading_command: bool = False
-    """Whether to use heading command or angular velocity command. Defaults to False.
+    # Heading 명령을 사용할지 여부를 결정하는 플래그. 기본값은 False임.
+    #
+    # True이면 지정된 범위에서 목표 방향을 균등하게 샘플링하고, 목표 방향과 현재 방향의 오차를 이용하여 각속도 명령을 계산함.
+    # False이면 지정된 범위에서 각속도 명령을 직접 균등하게 샘플링함.
 
-    If True, the angular velocity command is computed from the heading error, where the
-    target heading is sampled uniformly from provided range. Otherwise, the angular velocity
-    command is sampled uniformly from provided range.
-    """
 
     heading_control_stiffness: float = 1.0
-    """Scale factor to convert the heading error to angular velocity command. Defaults to 1.0."""
+    # heading 오차를 각속도 명령으로 변환할 때 사용하는 비례계수, 기본값 = 1.0.
 
     rel_standing_envs: float = 0.0
-    """The sampled probability of environments that should be standing still. Defaults to 0.0."""
+    # 각 환경이 정지 상태로 선택될 확률.
+
+    rel_rotating_envs: float = 0.0
+    # 각 환경이 회전 상태로 선택될 확률.
 
     rel_heading_envs: float = 1.0
-    """The sampled probability of environments where the robots follow the heading-based angular velocity command
-    (the others follow the sampled angular velocity command). Defaults to 1.0.
+    # 각 환경이 목표 방향의 오차로 계산한 각속도 명령을 따르도록 선택될 확률. 
+    # 나머지 환경은 직접 샘플링한 각속도 명령을 따름. 기본값은 1.0.
 
-    This parameter is only used if :attr:`heading_command` is True.
-    """
+    # 이 설정은 heading_command가 True일 때만 사용됨.
+    
+
+
 
     @configclass
     class Ranges:

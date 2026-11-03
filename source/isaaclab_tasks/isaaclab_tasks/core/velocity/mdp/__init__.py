@@ -7,4 +7,5 @@
 
 from isaaclab.utils.module import lazy_export
 
+#  __init__.pyi의 목록과 import 선언을 읽어 mdp.이름으로 접근할 수 있게 연결하는 함수
 lazy_export()

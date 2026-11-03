@@ -28,7 +28,7 @@ class G1FlatEnvCfg(G1RoughEnvCfg):
         self.scene.terrain.terrain_generator = None
         self.scene.height_scanner = None
         # observations
-        self.observations.policy.height_scan = None
+        self.observations.privileged_obs.height_scan = None
         # commands
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)

@@ -48,7 +48,7 @@ class H1FlatEnvCfg(H1RoughEnvCfg):
         self.scene.terrain.terrain_generator = None
         self.scene.height_scanner = None
         # observations
-        self.observations.policy.height_scan = None
+        self.observations.privileged_obs.height_scan = None
         # rewards
         self.rewards.feet_air_time.weight = 1.0
         self.rewards.feet_air_time.params["threshold"] = 0.6

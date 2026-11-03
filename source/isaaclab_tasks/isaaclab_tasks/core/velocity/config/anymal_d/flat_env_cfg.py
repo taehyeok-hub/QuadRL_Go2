@@ -29,7 +29,7 @@ class AnymalDFlatEnvCfg(AnymalDRoughEnvCfg):
         self.scene.terrain.terrain_generator = None
         self.scene.height_scanner = None
         # observations
-        self.observations.policy.height_scan = None
+        self.observations.privileged_obs.height_scan = None
         # rewards
         self.rewards.flat_orientation_l2.weight = -5.0
         self.rewards.dof_torques_l2.weight = -2.5e-5

@@ -12,10 +12,12 @@ import contextlib
 import logging
 import os
 
+import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from tensordict import TensorDict
 
 from isaaclab.app import add_launcher_args, launch_simulation
-from isaaclab.envs import DirectMARLEnvCfg
+from isaaclab.envs import DirectMARLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.utils import to_dict
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.seed import configure_seed
@@ -62,6 +64,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--external_callback", default=None, help="Fully qualified path to an externally defined callback."
+    )
+    controls = parser.add_mutually_exclusive_group()
+    controls.add_argument(
+        "--gamepad", action="store_true", help="Control base_velocity with a gamepad; Y toggles tracking."
+    )
+    controls.add_argument(
+        "--keyboard", action="store_true", help="Control base_velocity with the keyboard; Y toggles tracking."
+    )
+    parser.add_argument(
+        "--fixed_camera",
+        "--fixed-camera",
+        action="store_true",
+        help="Start manual playback with robot tracking disabled.",
     )
     cli_args.add_rsl_rl_args(parser)
     add_launcher_args(parser)
@@ -111,6 +126,25 @@ def run(argv: list[str]) -> None:
             show_run_summary(screen, args_cli, env_cfg, library="rsl_rl", action="play")
             agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
             apply_env_overrides(args_cli, env_cfg)
+            manual_control = args_cli.gamepad or args_cli.keyboard
+            if manual_control:
+                if not isinstance(env_cfg, ManagerBasedRLEnvCfg) or not hasattr(env_cfg.commands, "base_velocity"):
+                    raise ValueError(
+                        "--gamepad and --keyboard require a manager-based task with base_velocity commands."
+                    )
+                if env_cfg.scene.num_envs != 1:
+                    raise ValueError("--gamepad and --keyboard require --num_envs 1.")
+                env_cfg.terminations.time_out = None
+                command_cfg = env_cfg.commands.base_velocity
+                # Keep periodic resampling from overwriting manual commands.
+                command_cfg.resampling_time_range = (1.0e9, 1.0e9)
+                command_cfg.heading_command = False
+                command_cfg.rel_standing_envs = 0.0
+                command_cfg.rel_rotating_envs = 0.0
+                command_cfg.ranges.heading = None
+                command_cfg.ranges.lin_vel_x = (0.0, 0.0)
+                command_cfg.ranges.lin_vel_y = (0.0, 0.0)
+                command_cfg.ranges.ang_vel_z = (0.0, 0.0)
             # certain randomizations occur in the environment initialization so we set the seed here
             env_cfg.seed = agent_cfg.seed
 
@@ -150,14 +184,103 @@ def run(argv: list[str]) -> None:
             export_model_dir = os.path.join(log_dir, "exported")
             runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
             runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+            base_env = env.unwrapped
+            command_input = None
+            input_active = True
+            camera_button_held = False
+            camera = None
+
+            if manual_control:
+                from isaaclab_teleop import (
+                    CLOUDXR_STANDALONE_ENV,
+                    create_isaac_teleop_device,
+                    poll_control_events,
+                )
+
+                from ._playback_camera import PlaybackCamera
+
+                if args_cli.keyboard and not any(viz.key_event_source is not None for viz in base_env.sim.visualizers):
+                    raise ValueError("--keyboard requires an interactive window; pass --viz kit or --viz newton_gl.")
+                camera = PlaybackCamera(base_env, follow=not args_cli.fixed_camera)
+                cleanup.callback(camera.close)
+                if args_cli.gamepad:
+                    from ._playback_gamepad import gamepad_with_camera_cfg
+
+                    input_cfg = gamepad_with_camera_cfg(
+                        v_x_sensitivity=2.0,
+                        v_y_sensitivity=1.0,
+                        omega_z_sensitivity=3.0,
+                        dead_zone=0.15,
+                        sim_device=str(base_env.device),
+                    )
+                else:
+                    from ._playback_keyboard import wasd_keyboard_cfg
+
+                    input_cfg = wasd_keyboard_cfg(
+                        v_x_sensitivity=2.0,
+                        v_y_sensitivity=1.0,
+                        omega_z_sensitivity=3.0,
+                        sim_device=str(base_env.device),
+                    )
+                    logger.info(
+                        "Keyboard: w/a/s/d move, left/right arrows turn; "
+                        "b/p/r start/pause/reset; y toggles camera tracking."
+                    )
+                command_input = cleanup.enter_context(
+                    create_isaac_teleop_device(
+                        input_cfg,
+                        cloudxr_env_file=CLOUDXR_STANDALONE_ENV,
+                        use_kit_xr_bridge=False,
+                        visualizers=base_env.sim.visualizers,
+                    )
+                )
+                command_input.request_start()
 
             obs = env.get_observations()
 
             def step() -> None:
-                nonlocal obs
+                nonlocal obs, input_active, camera_button_held
+
+                if command_input is not None:
+                    manual_command = command_input.advance()
+                    control = poll_control_events(command_input)
+
+                    if args_cli.gamepad:
+                        camera_pressed = manual_command is not None and bool(manual_command[3].item() > 0.5)
+                        if camera_pressed and not camera_button_held:
+                            camera.toggle()
+                        camera_button_held = camera_pressed
+
+                    if control.is_active is not None:
+                        input_active = control.is_active
+
+                    if control.should_reset:
+                        env.reset()
+                        policy.reset(
+                            torch.ones(
+                                env.num_envs,
+                                dtype=torch.bool,
+                                device=base_env.device,
+                            )
+                        )
+                        input_active = False
+                        manual_command = None
+
+                    command = base_env.command_manager.get_command("base_velocity")
+                    command.zero_()
+                    if manual_command is not None and input_active:
+                        command.copy_(manual_command[:3].reshape(1, 3))
+
+                    # Recompute observations so the policy receives the new command.
+                    obs = TensorDict(
+                        base_env.observation_manager.compute(update_history=False),
+                        batch_size=[env.num_envs],
+                    )
+
                 obs, _, dones, _ = env.step(policy(obs))
-                # reset recurrent states for episodes that have terminated
                 policy.reset(dones)
+                if camera is not None:
+                    camera.update()
 
             screen.close()
             run_playback(step, dt=env.unwrapped.step_dt, args_cli=args_cli, env_cfg=env_cfg)

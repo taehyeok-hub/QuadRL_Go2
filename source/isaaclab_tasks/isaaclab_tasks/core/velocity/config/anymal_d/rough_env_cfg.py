@@ -5,16 +5,36 @@
 
 """Configuration for the ANYmal-D velocity-tracking environment on rough terrain."""
 
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass, replace
 
 from isaaclab_assets.robots.anymal import ANYMAL_D_CFG
 
-from ...velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from ... import mdp
+from ...velocity_env_cfg import LocomotionVelocityRoughEnvCfg, RewardsCfg
+
+
+@configclass
+class AnymalDRewards(RewardsCfg):
+    """Reward configuration for the ANYmal-D velocity-tracking environments."""
+
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time,
+        weight=0.125,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "threshold": 0.5,
+        },
+    )
 
 
 @configclass
 class AnymalDRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     """Configuration for the ANYmal-D velocity-tracking environment on rough terrain."""
+
+    rewards: AnymalDRewards = AnymalDRewards()
 
     def __post_init__(self):
         super().__post_init__()
@@ -25,3 +45,6 @@ class AnymalDRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state=replace(ANYMAL_D_CFG.init_state, pos=(0.0, 0.0, 0.65)),
         )
+
+        # rewards
+        self.rewards.undesired_contacts.params["sensor_cfg"].body_names = ".*THIGH"

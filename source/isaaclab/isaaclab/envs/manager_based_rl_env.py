@@ -22,7 +22,8 @@ from .manager_based_rl_env_cfg import ManagerBasedRLEnvCfg
 logger = logging.getLogger(__name__)
 
 
-class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
+# 강화학습 환경의 기본 설정
+class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env): 
     """The superclass for the manager-based workflow reinforcement learning-based environments.
 
     This class inherits from :class:`ManagerBasedEnv` and implements the core functionality for
