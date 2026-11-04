@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Behavior tests for timed Go2 homing targets without a simulation fixture."""
+"""Behavior tests for Go2 homing targets without a simulation fixture."""
 
 import torch
 
@@ -42,40 +42,27 @@ def test_go2_homing_poses_follow_joint_names_instead_of_storage_order():
     )
 
 
-def test_homing_sequence_interpolates_in_seconds_and_holds_each_endpoint():
-    """Each environment moves from its own measured pose before sharing the two targets."""
+def test_homing_sequence_uses_each_measured_start_and_holds_the_final_pose():
+    """Each cosine move uses its own duration and copied measured start before holding the final target."""
     initial = torch.tensor([[0.0, 0.0], [0.2, 0.4]])
     prepare_position = torch.tensor([1.0, 2.0])
     homing_position = torch.tensor([3.0, 4.0])
-    controller = Go2HomingController(initial, prepare_position, homing_position, move_time=2.0, hold_time=1.0)
+    controller = Go2HomingController(initial, prepare_position, homing_position, prepare_period=4, homing_period=2)
+    measured = initial.clone()
 
-    torch.testing.assert_close(controller.compute(1.0), torch.tensor([[0.5, 1.0], [0.6, 1.2]]))
-    torch.testing.assert_close(controller.compute(1.0), prepare_position.expand(2, -1))
-    assert controller.stage.tolist() == [1, 1]
-    torch.testing.assert_close(controller.compute(0.5), prepare_position.expand(2, -1))
-    assert controller.stage.tolist() == [1, 1]
-    torch.testing.assert_close(controller.compute(0.5), prepare_position.expand(2, -1))
-    assert controller.stage.tolist() == [2, 2]
-    torch.testing.assert_close(controller.compute(1.0), torch.tensor([[2.0, 3.0], [2.0, 3.0]]))
-    torch.testing.assert_close(controller.compute(1.0), homing_position.expand(2, -1))
-    assert controller.stage.tolist() == [3, 3]
-    torch.testing.assert_close(controller.compute(20.0), homing_position.expand(2, -1))
-
-
-def test_single_pose_holds_until_restarted_from_new_measured_positions():
-    """Selecting one pose stops the sequence; a later request starts from the measured state."""
-    prepare_position = torch.tensor([1.0, 2.0])
-    homing_position = torch.tensor([3.0, 4.0])
-    controller = Go2HomingController(torch.zeros(2, 2), prepare_position, homing_position, move_time=2.0, hold_time=0.5)
-    measured = torch.tensor([[0.0, 0.0], [0.2, 0.4]])
-    controller.start(measured, pose="prepare_position")
+    torch.testing.assert_close(controller.homing(measured), initial)
     measured.add_(10.0)
+    torch.testing.assert_close(
+        controller.homing(measured), torch.tensor([[0.14644661, 0.29289322], [0.31715729, 0.63431458]])
+    )
+    torch.testing.assert_close(controller.homing(measured), torch.tensor([[0.5, 1.0], [0.6, 1.2]]))
+    controller.homing(measured)
+    torch.testing.assert_close(controller.homing(measured), prepare_position.expand(2, -1))
 
-    torch.testing.assert_close(controller.compute(1.0), torch.tensor([[0.5, 1.0], [0.6, 1.2]]))
-    torch.testing.assert_close(controller.compute(1.0), prepare_position.expand(2, -1))
-    torch.testing.assert_close(controller.compute(20.0), prepare_position.expand(2, -1))
-
-    controller.start(torch.tensor([[2.0, 2.0], [4.0, 6.0]]), pose="homing_position")
-    torch.testing.assert_close(controller.compute(1.0), torch.tensor([[2.5, 3.0], [3.5, 5.0]]))
-    torch.testing.assert_close(controller.compute(1.0), homing_position.expand(2, -1))
-    torch.testing.assert_close(controller.compute(20.0), homing_position.expand(2, -1))
+    # The second move starts from the measured pose even when it lags behind the prepare target.
+    measured.copy_(torch.tensor([[0.8, 1.6], [0.6, 1.2]]))
+    torch.testing.assert_close(controller.homing(measured), torch.tensor([[0.8, 1.6], [0.6, 1.2]]))
+    measured.add_(10.0)
+    torch.testing.assert_close(controller.homing(measured), torch.tensor([[1.9, 2.8], [1.8, 2.6]]))
+    torch.testing.assert_close(controller.homing(measured), homing_position.expand(2, -1))
+    torch.testing.assert_close(controller.homing(measured), homing_position.expand(2, -1))

@@ -52,5 +52,5 @@ class UnitreeGo2FlatPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):
 
         self.max_iterations = 20000 # 5000
         self.experiment_name = "unitree_go2_flat"
-        self.actor.hidden_dims = [128, 128, 128]
-        self.critic.hidden_dims = [128, 128, 128]
+        # self.actor.hidden_dims = [128, 128, 128]
+        # self.critic.hidden_dims = [128, 128, 128]

@@ -32,6 +32,31 @@ def _is_moving_command(command: torch.Tensor, command_threshold: float) -> torch
     )
 
 
+def base_height_exp(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    height_sigma: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """몸통 높이가 목표 높이에 가까울수록 지수 보상을 반환함.
+
+    base_height_l2로 몸통 높이 오차의 제곱을 계산하고, exp(-(h - target_height) ** 2 / height_sigma)로 변환함.
+    목표 높이에서 반환값은 1이고, 높이 오차가 커질수록 0으로 수렴하도록 구성됨.
+    가중치와 제어 시간 간격은 RewardManager에서 별도로 곱함.
+
+    Args:
+        env: 보상을 계산할 강화학습 환경임.
+        target_height: 평지 지면이 월드 Z=0일 때의 목표 몸통 높이.
+        height_sigma: 높이 오차 제곱을 나누는 양의 민감도 계수이며 단위는 m²임. not std, 수식의 분모에 직접 사용하는 값.
+        asset_cfg: 몸통 높이를 읽을 로봇의 선택 설정임.
+
+    Returns:
+        환경별 지수 보상이며, 가중치와 시간 배율을 적용하기 전의 값임.
+    """
+    height_error = mdp.base_height_l2(env, target_height=target_height, asset_cfg=asset_cfg)
+    return torch.exp(-height_error / height_sigma)
+
+
 def feet_air_time(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -269,6 +294,112 @@ def feet_clearance(
     cost = torch.where(foot_speed_xy >= min_foot_speed, per_foot_cost, 0.0).sum(dim=1)
     command = env.command_manager.get_command(command_name)
     return cost * _is_moving_command(command, command_threshold)
+
+
+def _swing_foot_direction_score(
+    env: ManagerBasedRLEnv,
+    reference_velocity: torch.Tensor,
+    active: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    min_foot_speed: float,
+    contact_threshold: float,
+    opposed: bool,
+) -> torch.Tensor:
+    """기준 방향에 대한 스윙 발의 정렬 또는 역정렬 점수를 발 속력으로 가중 평균함."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    foot_velocity_w = asset.data.body_link_lin_vel_w.torch[:, asset_cfg.body_ids]
+    heading = yaw_quat(asset.data.root_quat_w.torch)[:, None, :]
+    foot_velocity_xy = quat_apply_inverse(heading, foot_velocity_w)[..., :2]
+    foot_speed = torch.linalg.vector_norm(foot_velocity_xy, dim=-1)
+
+    eps = 1.0e-6
+    foot_direction = foot_velocity_xy / (foot_speed.unsqueeze(-1) + eps)
+    reference_direction = reference_velocity / (
+        torch.linalg.vector_norm(reference_velocity, dim=-1, keepdim=True) + eps
+    )
+    cosine = (foot_direction * reference_direction.unsqueeze(1)).sum(dim=-1).clamp(-1.0, 1.0)
+    score = 0.5 * (1.0 - cosine) if opposed else 0.5 * (1.0 + cosine)
+
+    contact = contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids, 2] > contact_threshold
+    valid = ~contact & (foot_speed > min_foot_speed) & active.unsqueeze(1)
+    weights = torch.where(valid, foot_speed, 0.0)
+    average = (score * weights).sum(dim=1) / (weights.sum(dim=1) + eps)
+    return torch.where(valid.any(dim=1), average, 0.0)
+
+
+def foot_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_threshold: float = 0.1,
+    min_foot_speed: float = 0.03,
+    contact_threshold: float = 1.0,
+) -> torch.Tensor:
+    """스윙 중인 발의 수평 이동 방향이 선속도 명령 방향과 일치할수록 보상함.
+
+    quadflat_lab과 동일하게 발 링크 원점의 월드 속도를 역 yaw 회전하며, 몸통 속도는 빼지 않음.
+    현재 총 접촉력의 월드 Z 성분이 contact_threshold 이하이고 수평 속력이 min_foot_speed를 넘는 발을 평가함.
+    선속도 명령의 X 또는 Y 성분 절댓값이 command_threshold 이상일 때만 활성화함.
+    (1 + cos(theta)) / 2를 발 속력으로 가중 평균하므로 같은 방향은 1, 직각은 0.5, 반대 방향은 0에 가까움.
+    접촉 이력은 사용하지 않으며, 순수 회전 명령이나 유효한 스윙 발이 없는 경우 0을 반환함.
+    로봇과 센서의 발 선택은 같은 순서여야 하며, 가중치와 시간 배율은 RewardManager에서 별도로 적용함.
+
+    Args:
+        command_name: 몸통 기준 vx, vy, yaw 각속도 명령을 제공하는 명령 항의 이름임.
+        sensor_cfg: 현재 접촉력을 읽을 발 센서의 선택 설정임.
+        asset_cfg: 발 링크 속도와 몸통 자세를 읽을 로봇의 선택 설정임.
+        command_threshold: 각 선속도 명령 성분의 활성화 임계값이며 단위는 m/s임.
+        min_foot_speed: 평가할 발의 최소 수평 속력이며 단위는 m/s임.
+        contact_threshold: 접촉으로 판정할 월드 Z 힘의 임계값이며 단위는 N임.
+    """
+    command = env.command_manager.get_command(command_name)
+    active = (command[:, :2].abs() >= command_threshold).any(dim=1)
+    return _swing_foot_direction_score(
+        env, command[:, :2], active, asset_cfg, sensor_cfg, min_foot_speed, contact_threshold, opposed=False
+    )
+
+
+def foot_misalignment(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_threshold: float = 0.1,
+    min_foot_speed: float = 0.03,
+    min_base_speed: float = 0.05,
+    contact_threshold: float = 1.0,
+) -> torch.Tensor:
+    """스윙 발이 실제 몸통 진행 방향과 어긋날수록 커지는 비용을 반환함.
+
+    기준은 명령 방향이 아니라 root_lin_vel_b의 XY 방향이며, 음의 가중치로 적용하여 역정렬을 감점함.
+    quadflat_lab의 계산을 유지하므로 발 속도는 yaw 좌표계, 몸통 속도는 roll과 pitch도 반영한 몸통 좌표계임.
+    발 속도에서 몸통 속도는 빼지 않으며, 기울어진 자세에서는 두 좌표계가 일치하지 않을 수 있음.
+    현재 총 접촉력의 월드 Z 성분이 contact_threshold 이하이고 수평 속력이 min_foot_speed를 넘는 발을 평가함.
+    몸통 XY 속력이 min_base_speed를 넘고, vx, vy, yaw 명령 중 하나의 절댓값이 command_threshold 이상일 때 활성화함.
+    (1 - cos(theta)) / 2를 발 속력으로 가중 평균하므로 같은 방향은 0, 직각은 0.5, 반대 방향은 1에 가까움.
+    접촉 이력은 사용하지 않으며, 정지 명령이나 유효한 스윙 발이 없는 경우 0을 반환함.
+    로봇과 센서의 발 선택은 같은 순서여야 하며, 가중치와 시간 배율은 RewardManager에서 별도로 적용함.
+
+    Args:
+        command_name: 몸통 기준 vx, vy, yaw 각속도 명령을 제공하는 명령 항의 이름임.
+        sensor_cfg: 현재 접촉력을 읽을 발 센서의 선택 설정임.
+        asset_cfg: 발 링크 속도와 실제 몸통 속도를 읽을 로봇의 선택 설정임.
+        command_threshold: 각 명령 성분의 활성화 임계값이며 선속도는 m/s, yaw 각속도는 rad/s 기준임.
+        min_foot_speed: 평가할 발의 최소 수평 속력이며 단위는 m/s임.
+        min_base_speed: 실제 진행 방향을 평가할 최소 몸통 XY 속력이며 단위는 m/s임.
+        contact_threshold: 접촉으로 판정할 월드 Z 힘의 임계값이며 단위는 N임.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    base_velocity = asset.data.root_lin_vel_b.torch[:, :2]
+    active = (command[:, :3].abs() >= command_threshold).any(dim=1)
+    active &= torch.linalg.vector_norm(base_velocity, dim=-1) > min_base_speed
+    return _swing_foot_direction_score(
+        env, base_velocity, active, asset_cfg, sensor_cfg, min_foot_speed, contact_threshold, opposed=True
+    )
 
 
 def track_lin_vel_xy_yaw_frame_exp(

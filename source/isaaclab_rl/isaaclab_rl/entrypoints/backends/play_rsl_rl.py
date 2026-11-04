@@ -17,7 +17,7 @@ from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 from tensordict import TensorDict
 
 from isaaclab.app import add_launcher_args, launch_simulation
-from isaaclab.envs import DirectMARLEnvCfg, ManagerBasedRLEnvCfg
+from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.utils import to_dict
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.seed import configure_seed
@@ -128,23 +128,30 @@ def run(argv: list[str]) -> None:
             apply_env_overrides(args_cli, env_cfg)
             manual_control = args_cli.gamepad or args_cli.keyboard
             if manual_control:
-                if not isinstance(env_cfg, ManagerBasedRLEnvCfg) or not hasattr(env_cfg.commands, "base_velocity"):
-                    raise ValueError(
-                        "--gamepad and --keyboard require a manager-based task with base_velocity commands."
-                    )
                 if env_cfg.scene.num_envs != 1:
                     raise ValueError("--gamepad and --keyboard require --num_envs 1.")
-                env_cfg.terminations.time_out = None
-                command_cfg = env_cfg.commands.base_velocity
-                # Keep periodic resampling from overwriting manual commands.
-                command_cfg.resampling_time_range = (1.0e9, 1.0e9)
-                command_cfg.heading_command = False
-                command_cfg.rel_standing_envs = 0.0
-                command_cfg.rel_rotating_envs = 0.0
-                command_cfg.ranges.heading = None
-                command_cfg.ranges.lin_vel_x = (0.0, 0.0)
-                command_cfg.ranges.lin_vel_y = (0.0, 0.0)
-                command_cfg.ranges.ang_vel_z = (0.0, 0.0)
+                if isinstance(env_cfg, ManagerBasedRLEnvCfg) and hasattr(env_cfg.commands, "base_velocity"):
+                    env_cfg.terminations.time_out = None
+                    command_cfg = env_cfg.commands.base_velocity
+                    controlled_asset_name = command_cfg.asset_name
+                    # Keep periodic resampling from overwriting manual commands.
+                    command_cfg.resampling_time_range = (1.0e9, 1.0e9)
+                    command_cfg.heading_command = False
+                    command_cfg.rel_standing_envs = 0.0
+                    command_cfg.rel_rotating_envs = 0.0
+                    command_cfg.ranges.heading = None
+                    command_cfg.ranges.lin_vel_x = (0.0, 0.0)
+                    command_cfg.ranges.lin_vel_y = (0.0, 0.0)
+                    command_cfg.ranges.ang_vel_z = (0.0, 0.0)
+                elif isinstance(env_cfg, DirectRLEnvCfg) and callable(
+                    configure_manual_control := getattr(env_cfg, "configure_manual_velocity_control", None)
+                ):
+                    controlled_asset_name = configure_manual_control()
+                else:
+                    raise ValueError(
+                        "--gamepad and --keyboard require base_velocity commands or a direct task implementing"
+                        " configure_manual_velocity_control() and set_external_commands()."
+                    )
             # certain randomizations occur in the environment initialization so we set the seed here
             env_cfg.seed = agent_cfg.seed
 
@@ -201,7 +208,7 @@ def run(argv: list[str]) -> None:
 
                 if args_cli.keyboard and not any(viz.key_event_source is not None for viz in base_env.sim.visualizers):
                     raise ValueError("--keyboard requires an interactive window; pass --viz kit or --viz newton_gl.")
-                camera = PlaybackCamera(base_env, follow=not args_cli.fixed_camera)
+                camera = PlaybackCamera(base_env, asset_name=controlled_asset_name, follow=not args_cli.fixed_camera)
                 cleanup.callback(camera.close)
                 if args_cli.gamepad:
                     from ._playback_gamepad import gamepad_with_camera_cfg
@@ -235,6 +242,7 @@ def run(argv: list[str]) -> None:
                     )
                 )
                 command_input.request_start()
+                manual_velocity = torch.zeros(env.num_envs, 3, device=base_env.device)
 
             obs = env.get_observations()
 
@@ -266,16 +274,20 @@ def run(argv: list[str]) -> None:
                         input_active = False
                         manual_command = None
 
-                    command = base_env.command_manager.get_command("base_velocity")
-                    command.zero_()
+                    manual_velocity.zero_()
                     if manual_command is not None and input_active:
-                        command.copy_(manual_command[:3].reshape(1, 3))
+                        manual_velocity.copy_(manual_command[:3].reshape(1, 3))
 
                     # Recompute observations so the policy receives the new command.
-                    obs = TensorDict(
-                        base_env.observation_manager.compute(update_history=False),
-                        batch_size=[env.num_envs],
-                    )
+                    if isinstance(env_cfg, ManagerBasedRLEnvCfg):
+                        base_env.command_manager.get_command("base_velocity").copy_(manual_velocity)
+                        obs = TensorDict(
+                            base_env.observation_manager.compute(update_history=False),
+                            batch_size=[env.num_envs],
+                        )
+                    else:
+                        base_env.set_external_commands(manual_velocity)
+                        obs = env.get_observations()
 
                 obs, _, dones, _ = env.step(policy(obs))
                 policy.reset(dones)

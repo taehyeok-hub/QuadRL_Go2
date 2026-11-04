@@ -11,7 +11,7 @@ from isaaclab.visualizers import add_key_callbacks
 class PlaybackCamera:
     """Toggle robot tracking with Y, leaving the viewer camera free when disabled."""
 
-    def __init__(self, env, *, follow: bool = True) -> None:
+    def __init__(self, env, *, asset_name: str, follow: bool = True) -> None:
         self._visualizers = tuple(env.sim.visualizers)
         self._follow = follow
         self._closed = False
@@ -25,7 +25,6 @@ class PlaybackCamera:
                 backend.origin_type = "world"
         self._asset = None
         if self._visualizers:
-            asset_name = env.cfg.commands.base_velocity.asset_name
             self._asset = env.scene[asset_name]
         self._remove_keys = add_key_callbacks(self._visualizers, {"Y": self.toggle})
         self.update()

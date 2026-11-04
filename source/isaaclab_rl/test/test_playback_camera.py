@@ -16,8 +16,8 @@ from isaaclab.visualizers import KeyEventSource
 from isaaclab_rl.entrypoints.backends._playback_camera import PlaybackCamera
 
 
-def test_playback_camera_tracks_robot_until_y_and_releases_keyboard():
-    """Y switches a moving robot's camera between tracking and free navigation."""
+def test_playback_camera_tracks_robot_without_commands_and_releases_keyboard():
+    """An explicit robot supports tracking and free navigation without command managers."""
     source = KeyEventSource()
     backend = SimpleNamespace(visualizer_type="kit", origin_type="asset")
     views = []
@@ -36,10 +36,9 @@ def test_playback_camera_tracks_robot_until_y_and_releases_keyboard():
     position = torch.tensor([[1.0, 2.0, 0.5]])
     env = SimpleNamespace(
         sim=SimpleNamespace(visualizers=[viz]),
-        cfg=SimpleNamespace(commands=SimpleNamespace(base_velocity=SimpleNamespace(asset_name="controlled_robot"))),
         scene={"controlled_robot": SimpleNamespace(data=SimpleNamespace(root_pos_w=SimpleNamespace(torch=position)))},
     )
-    camera = PlaybackCamera(env)
+    camera = PlaybackCamera(env, asset_name="controlled_robot")
     assert views[-1] == ((5.0, -1.0, 2.5), (1.0, 2.0, 1.0))
     assert backend.origin_type == "world"
 

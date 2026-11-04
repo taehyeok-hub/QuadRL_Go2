@@ -258,13 +258,18 @@ def joint_pos_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEn
 def joint_vel_limits(
     env: ManagerBasedRLEnv, soft_ratio: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
-    """Penalize joint velocities if they cross the soft limits.
+    """ 관절 속도가 soft limit을 초과하면 패널티를 가하는 함수.
 
-    This is computed as a sum of the absolute value of the difference between the joint velocity and the soft limits.
+    관절 속도가 soft limits에 soft_ratio를 곱한 임계값을 초과한 양을 합산함.
+    이 함수는 관절 속도와 soft limits 사이의 차이의 절대값을 계산함.
+
+    실물의 속도·토크 한계는 제어기와 모터 설정에 반영하지만, 이 리워드만으로는 제한을 보장하지 못하기에, 
+    바로 적용하기보다는 관절이 허용속도에 자주 접근하거나 초과할 때 선택적으로 활용함.
 
     Args:
-        soft_ratio: The ratio of the soft limits to be used.
+        soft_ratio: 감점 시작 임계값을 정하는 속도 한계의 비율임. 1보다 작으면 한계 도달 전부터 감점함.
     """
+
     asset: Articulation = env.scene[asset_cfg.name]
     out_of_limits = (
         torch.abs(asset.data.joint_vel.torch[:, asset_cfg.joint_ids])
@@ -315,7 +320,12 @@ Contact sensor.
 
 
 def undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Penalize undesired contacts as the number of violations that are above a threshold."""
+    """최근 법선 접촉력 이력의 최대값이 임계값을 넘은 부위 수를 반환함.
+
+    짧은 접촉을 놓치지 않도록 이력을 사용하므로, 접촉이 끝나도 해당 기록이 남아 있으면 판정에 포함함.
+    임계값을 1 N에서 0.1 N으로 낮추면 이력의 최대값이 0.1 N 초과 1 N 이하인 부위도 추가 판정함.
+    부위당 감점 가중치는 유지되며, 추가 판정되는 약한 접촉이 드물면 보상 변화도 작은 편임.
+    """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     # check if contact force is above threshold
     net_contact_forces = contact_sensor.data.net_normal_forces_w_history.torch

@@ -8,9 +8,156 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from isaaclab.managers import RewardTermCfg, SceneEntityCfg
+from isaaclab.managers import RewardManager, RewardTermCfg, SceneEntityCfg
+from isaaclab.utils.math import quat_from_euler_xyz
+from isaaclab.utils.string import resolve_matching_names
 
 from isaaclab_tasks.core.velocity import mdp
+
+
+def test_go2_flat_foot_direction_rewards_match_quadflat_geometry_and_gates():
+    """실제 보상 설정의 방향 기준, 속력 가중 평균, 접촉·명령 경계와 좌표 변환을 검증함."""
+    from isaaclab_tasks.core.velocity.config.go2.flat_env_cfg import UnitreeGo2FlatEnvCfg
+
+    cfg = UnitreeGo2FlatEnvCfg()
+    num_envs = 23
+    commands = torch.tensor([[1.0, 0.0, 0.0]] * num_envs)
+    base_velocity = torch.tensor([[1.0, 0.0, 0.0]] * num_envs)
+    foot_velocity = torch.zeros(num_envs, 4, 3)
+    foot_velocity[:, 0, 0] = 1.0
+    forces = torch.zeros_like(foot_velocity)
+    roll = torch.zeros(num_envs)
+    pitch = torch.zeros(num_envs)
+    yaw = torch.zeros(num_envs)
+
+    foot_velocity[1, 0] = torch.tensor([0.0, 1.0, 0.0])  # 직각
+    foot_velocity[2, 0, 0] = -1.0  # 반대 방향
+    foot_velocity[3, 1, 0] = -3.0  # 정렬 속력 1, 역정렬 속력 3
+    base_velocity[4, 0] = -1.0  # 명령과 실제 진행 방향이 반대임
+    yaw[5] = torch.pi / 2
+    foot_velocity[5, 0] = torch.tensor([0.0, 1.0, 0.0])
+    forces[6, 0, 2] = 1.001  # 접촉한 발은 제외함
+    forces[7, 0, 2] = 1.0  # 정확히 1 N이면 스윙으로 판정함
+    foot_velocity[8, 0, 0] = 0.03  # 최소 발 속력은 초과해야 함
+    commands[9] = torch.tensor([0.099, 0.099, 0.0])  # 명령 벡터 크기가 아닌 각 성분으로 판정함
+    commands[10, 0] = 0.1  # 정확히 명령 임계값이면 활성화함
+    base_velocity[11, 0] = 0.05  # 최소 몸통 속력은 초과해야 함
+    foot_velocity[11, 0, 0] = -1.0
+    commands[12] = torch.tensor([0.0, 0.0, -0.2])  # 순수 회전 중 선속도 드리프트
+    foot_velocity[12, 0, 0] = -1.0
+    commands[13] = 0.0  # 정지 명령에서는 드리프트해도 비활성화함
+    foot_velocity[13, 0, 0] = -1.0
+    foot_velocity[14] = 0.0
+    foot_velocity[14, 0, 2] = 2.0  # 수직으로만 움직이는 발은 평가하지 않음
+    forces[15, 0, 0] = 2.0  # 힘의 norm이 아닌 월드 Z 성분으로 접촉을 판정함
+    foot_velocity[16, 0, 0] = 0.0301
+    base_velocity[17, 0] = 0.0501
+    foot_velocity[17, 0, 0] = -1.0
+    commands[18] = torch.tensor([0.0, 0.0, 0.2])
+    base_velocity[18] = 0.0  # 제자리 회전에서는 두 항 모두 0임
+    roll[19], pitch[19], yaw[19] = torch.pi / 4, torch.pi / 6, torch.pi / 2
+    foot_velocity[19, 0] = torch.tensor([0.0, 1.0, 0.0])  # 발 속도에는 yaw만 제거함
+    foot_velocity[20, 1, 0] = -3.0
+    forces[20, 1, 2] = 2.0  # 빠른 역방향 발도 접촉 상태이면 평균에서 제외함
+    commands[21] = torch.tensor([0.0, 1.0, 0.0])
+    foot_velocity[21, 0] = torch.tensor([0.0, 1.0, 0.0])  # 횡이동도 같은 방식으로 평가함
+    base_velocity[22] = torch.tensor([0.0, 1.0, 0.0])  # 실제 진행 방향이 명령에 직각임
+
+    feet = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+    asset_names = ["base", "RR_foot", "FL_foot", "FR_thigh", "RL_foot", "FR_foot"]
+    sensor_names = ["FR_foot", "RL_foot", "base", "RR_foot", "FL_foot"]
+    link_velocity = torch.zeros(num_envs, len(asset_names), 3)
+    contact_forces = torch.zeros(num_envs, len(sensor_names), 3)
+    link_velocity[:, [asset_names.index(name) for name in feet]] = foot_velocity
+    contact_forces[:, [sensor_names.index(name) for name in feet]] = forces
+    asset = SimpleNamespace(
+        num_bodies=len(asset_names),
+        body_names=asset_names,
+        find_bodies=lambda names, preserve_order: resolve_matching_names(names, asset_names, preserve_order),
+        data=SimpleNamespace(
+            body_link_lin_vel_w=SimpleNamespace(torch=link_velocity),
+            root_lin_vel_b=SimpleNamespace(torch=base_velocity),
+            root_quat_w=SimpleNamespace(torch=quat_from_euler_xyz(roll, pitch, yaw)),
+        ),
+    )
+    sensor = SimpleNamespace(
+        num_sensors=len(sensor_names),
+        body_names=sensor_names,
+        find_sensors=lambda names, preserve_order: resolve_matching_names(names, sensor_names, preserve_order),
+        data=SimpleNamespace(
+            net_forces_w=SimpleNamespace(torch=contact_forces),
+            net_forces_w_history=SimpleNamespace(torch=torch.full((num_envs, 3, len(sensor_names), 3), 100.0)),
+        ),
+    )
+
+    class Scene(dict):
+        sensors = {"contact_forces": sensor}
+
+    env = SimpleNamespace(
+        num_envs=num_envs,
+        device="cpu",
+        sim=SimpleNamespace(is_playing=lambda: True),
+        scene=Scene(robot=asset, contact_forces=sensor),
+        command_manager=SimpleNamespace(get_command={"base_velocity": commands}.__getitem__),
+    )
+    manager = RewardManager(
+        {"foot_alignment": cfg.rewards.foot_alignment, "foot_misalignment": cfg.rewards.foot_misalignment}, env
+    )
+    reward = manager.compute(cfg.decimation * cfg.sim.dt)
+    expected = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.5, 0.5],
+            [0.0, 1.0],
+            [0.25, 0.75],
+            [1.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.5],
+            [1.0, 0.5],
+        ]
+    )
+    weighted_terms = torch.tensor(
+        [[value[0] for _, value in manager.get_active_iterable_terms(i)] for i in range(num_envs)]
+    )
+    torch.testing.assert_close(weighted_terms, expected * torch.tensor([0.05, -0.05]), atol=5.0e-6, rtol=0.0)
+    torch.testing.assert_close(reward, 0.001 * (expected[:, 0] - expected[:, 1]), atol=2.0e-7, rtol=0.0)
+
+
+def test_go2_flat_height_reward_matches_quadflat_exponential():
+    """실제 평지 설정의 목표 높이, 지수 보상 폭, 가중치와 시간 배율을 검증함."""
+    from isaaclab_tasks.core.velocity.config.go2.flat_env_cfg import UnitreeGo2FlatEnvCfg
+
+    cfg = UnitreeGo2FlatEnvCfg()
+    positions = torch.zeros(5, 3)
+    positions[:, 2] = torch.tensor([0.30, 0.25, 0.35, 0.20, 0.40])
+    env = SimpleNamespace(
+        num_envs=5,
+        device="cpu",
+        sim=SimpleNamespace(is_playing=lambda: True),
+        scene={"robot": SimpleNamespace(data=SimpleNamespace(root_pos_w=SimpleNamespace(torch=positions)))},
+    )
+    manager = RewardManager(
+        {"base_height_exp": cfg.rewards.base_height_exp, "base_height_l2": cfg.rewards.base_height_l2}, env
+    )
+
+    value = manager.compute(cfg.decimation * cfg.sim.dt)
+
+    torch.testing.assert_close(value, torch.tensor([0.04, 0.0242612264, 0.0242612264, 0.0054134113, 0.0054134113]))
 
 
 @pytest.fixture

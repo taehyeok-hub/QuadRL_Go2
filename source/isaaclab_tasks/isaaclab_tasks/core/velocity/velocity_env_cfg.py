@@ -304,7 +304,7 @@ class EventsCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # -- task
+    # --- task rewards ---
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
@@ -312,9 +312,13 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
 
-    # -- penalties
+
+    # --- posture rewards / penalties ---
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+
+
+    # --- dof rewards / penalties ---
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
@@ -323,11 +327,66 @@ class RewardsCfg:
         func=mdp.undesired_contacts,
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]), 
-                "threshold": 1.0,
+                "threshold": 0.1,
         },
     )
     
-    # -- optional penalties
+    # --- stand_still penalties ---
+    stand_still_joint_position = RewTerm(
+        func=mdp.stand_still_joint_deviation_l1,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.05,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    
+    stand_still_joint_velocity = RewTerm(
+        func=mdp.stand_still_joint_velocity,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "velocity_sigma": 1.0,
+            "command_threshold": 0.05,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+
+    stand_still_contact = RewTerm(
+        func=mdp.stand_still_contact,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.05,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+            ),
+        },
+    )
+
+    stand_still_foot_position = RewTerm(
+        func=mdp.stand_still_foot_position_l2,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.05,
+            "default_foot_positions": [
+                (0.194682, 0.142000),  # FL
+                (0.194682, -0.142000),  # FR
+                (-0.192118, 0.142000),  # RL
+                (-0.192118, -0.142000),  # RR
+            ],
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
 
