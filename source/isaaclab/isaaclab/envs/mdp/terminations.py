@@ -66,9 +66,11 @@ Root terminations.
 def bad_orientation(
     env: ManagerBasedRLEnv, limit_angle: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
-    """Terminate when the asset's orientation is too far from the desired orientation limits.
+    """몸통의 전체 기울기가 설정한 제한 각도를 초과하면 에피소드를 종료함.
 
-    This is computed by checking the angle between the projected gravity vector and the z-axis.
+    몸통 좌표계에 투영한 중력의 Z 성분으로 몸통 +Z축과 월드 +Z축 사이의 각도를 계산함.
+    roll과 pitch를 각각 비교하지 않고 두 회전이 반영된 전체 기울기를 평가함.
+    yaw 회전은 기울기에 영향을 주지 않으며, 제한 각도와 정확히 같으면 종료하지 않음.
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     return torch.acos(-asset.data.projected_gravity_b.torch[:, 2]).abs() > limit_angle

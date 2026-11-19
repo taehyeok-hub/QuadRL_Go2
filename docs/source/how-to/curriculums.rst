@@ -118,3 +118,9 @@ syntax. It otherwise behaves identically to :class:`modify_env_param`.
            }
        }
    )
+
+
+.. seealso::
+
+   :doc:`learning_progress_curriculum` describes automatic terrain and command-task
+   sampling from signed learning progress, including EPTE-SP logging and Go2 usage.

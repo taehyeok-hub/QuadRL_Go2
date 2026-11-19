@@ -87,6 +87,8 @@ class TerrainGenerator:
 
     terrain_mesh: trimesh.Trimesh
     """A single trimesh.Trimesh object for all the generated sub-terrains."""
+    generation_seed: int
+    """Resolved seed used to generate this terrain, including a seed inherited from NumPy."""
     terrain_meshes: list[trimesh.Trimesh]
     """List of trimesh.Trimesh objects for all the generated sub-terrains."""
     terrain_origins: np.ndarray
@@ -142,6 +144,7 @@ class TerrainGenerator:
             seed = self.cfg.seed
         else:
             seed = np.random.get_state()[1][0]
+        self.generation_seed = int(seed)
         # set the seed for reproducibility
         # note: we create a new random number generator to avoid affecting the global state
         #  in the other places where random numbers are used.
@@ -233,13 +236,13 @@ class TerrainGenerator:
             self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_index])
 
     def _generate_curriculum_terrains(self):
-        """Add terrains based on the difficulty parameter."""
-        # normalize the proportions of the sub-terrains
+        """difficulty parameter(0~1)으로 지형을 생성함."""
+        # sub-terrains 의 비율을 정규화
         proportions = np.array([sub_cfg.proportion for sub_cfg in self.cfg.sub_terrains.values()], dtype=float)
         proportions /= np.sum(proportions)
 
-        # find the sub-terrain index for each column
-        # we generate the terrains based on their proportion (not randomly sampled)
+        # 각 cols마다 sub-terrain 생성
+        # --> 랜덤 샘플링이 아닌 proportion에 따른 지형 생성 알고리즘
         sub_indices = []
         for index in range(self.cfg.num_cols):
             sub_index = np.min(np.where(index / self.cfg.num_cols + 0.001 < np.cumsum(proportions))[0])
@@ -248,21 +251,17 @@ class TerrainGenerator:
         # create a list of all terrain configs
         sub_terrains_cfgs = list(self.cfg.sub_terrains.values())
 
-        # curriculum-based sub-terrains
+        # 모든 칸을 돌면서 rows에 맞는 difficulty 설정
+        # --> 열이 결정하는 것: 사용할 지형 종류
+        # --> 행이 결정하는 것: difficulty가 속할 구간
         for sub_col in range(self.cfg.num_cols):
             for sub_row in range(self.cfg.num_rows):
-                # vary the difficulty parameter linearly over the number of rows
-                # note: based on the proportion, multiple columns can have the same sub-terrain type.
-                #  Thus to increase the diversity along the rows, we add a small random value to the difficulty.
-                #  This ensures that the terrains are not exactly the same. For example, if the
-                #  the row index is 2 and the number of rows is 10, the nominal difficulty is 0.2.
-                #  We add a small random value to the difficulty to make it between 0.2 and 0.3.
+                # difficulty = lower + (upper - lower) * (row + random값) / num_rows        # (random값은 0 이상 1 미만)
                 lower, upper = self.cfg.difficulty_range
                 difficulty = (sub_row + self.np_rng.uniform()) / self.cfg.num_rows
                 difficulty = lower + (upper - lower) * difficulty
-                # generate terrain
+                # 지형 생성하기
                 mesh, origin = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_indices[sub_col]])
-                # add to sub-terrains
                 self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_indices[sub_col]])
 
     """

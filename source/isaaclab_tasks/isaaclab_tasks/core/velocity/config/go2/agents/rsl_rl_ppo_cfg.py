@@ -10,7 +10,13 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 @configclass
 class UnitreeGo2RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24      # 24 steps로 데이터를 수집하고, 1번 PPO 학습을 수행 (24 steps + PPO학습 = 1 iteration)
+    """스케일 적용 전 환경 입력을 ±10으로 제한하며 이전 action 관측에도 제한된 값을 사용함.
+
+    평지 설정도 이 값을 상속하며 정책이 샘플링한 원래 출력은 PPO와 진단 기록에 유지함.
+    """
+
+    num_steps_per_env = 24  # 24 steps로 데이터를 수집하고, 1번 PPO 학습을 수행 (24 steps + PPO학습 = 1 iteration)
+    init_at_random_ep_len = False
     max_iterations = 20000
     save_interval = 100
     experiment_name = "unitree_go2_rough"
@@ -43,14 +49,17 @@ class UnitreeGo2RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+    clip_actions = 10.0     # raw_action에 대한 clamping 진행
 
 
 @configclass
 class UnitreeGo2FlatPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):
+    init_at_random_ep_len = True
+
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 20000 # 5000
+        self.max_iterations = 20000  # 5000
         self.experiment_name = "unitree_go2_flat"
         # self.actor.hidden_dims = [128, 128, 128]
         # self.critic.hidden_dims = [128, 128, 128]

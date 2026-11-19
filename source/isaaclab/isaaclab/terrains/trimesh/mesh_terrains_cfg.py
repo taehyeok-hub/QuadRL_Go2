@@ -37,8 +37,16 @@ class MeshPyramidStairsTerrainCfg(SubTerrainBaseCfg):
     step_height_range: tuple[float, float] = MISSING
     """The minimum and maximum height of the steps (in m)."""
 
-    step_width: float = MISSING
-    """The width of the steps (in m)."""
+    step_width: float | None = None
+    """The fixed width of the steps (in m). Required when :attr:`step_width_range` is None."""
+
+    step_width_range: tuple[float, float] | None = None
+    """Step widths at difficulty 0 and 1 (in m), linearly interpolated with difficulty.
+
+    When set, this overrides :attr:`step_width`. Both endpoints must be finite and positive.
+    Descending endpoints are supported to make higher-difficulty steps narrower.
+    All steps within one generated terrain use the same resolved width.
+    """
 
     platform_width: float = 1.0
     """The width of the square platform at the center of the terrain. Defaults to 1.0."""

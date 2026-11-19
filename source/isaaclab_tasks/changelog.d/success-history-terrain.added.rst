@@ -1,0 +1,1 @@
+* Added a reusable two-episode success-history terrain curriculum with directional border goals, separate ascent/descent metrics, and resumable terrain assignments. Go2 rough now uses it by default; older curriculum checkpoints require --reset_curriculum.

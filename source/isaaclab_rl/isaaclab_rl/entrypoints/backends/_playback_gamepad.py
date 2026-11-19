@@ -35,9 +35,21 @@ class _CameraButton(BaseRetargeter):
         outputs["camera"][0] = 0.0 if gamepad.is_none else float(gamepad[GamepadInputIndex.NORTH_CLICK])
 
 
-def gamepad_with_camera_cfg(**kwargs) -> IsaacTeleopCfg:
-    """Extend the standard gamepad pipeline with a fourth, camera-button value."""
-    cfg = se2_gamepad_teleop_cfg(**kwargs)
+def gamepad_with_camera_cfg(
+    v_x_sensitivity: float = 1.0,
+    v_y_sensitivity: float = 1.0,
+    omega_z_sensitivity: float = 1.0,
+    dead_zone: float = 0.15,
+    sim_device: str = "cpu",
+) -> IsaacTeleopCfg:
+    """Map sticks to body-frame velocities (x forward, y left, yaw CCW) and append Y."""
+    cfg = se2_gamepad_teleop_cfg(
+        v_x_sensitivity=v_x_sensitivity,
+        v_y_sensitivity=-v_y_sensitivity,
+        omega_z_sensitivity=-omega_z_sensitivity,
+        dead_zone=dead_zone,
+        sim_device=sim_device,
+    )
     build_motion = cfg.pipeline_builder
 
     def build_pipeline() -> OutputCombiner:

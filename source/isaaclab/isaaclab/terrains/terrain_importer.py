@@ -79,6 +79,8 @@ class TerrainImporter:
         self.env_origins = None  # assigned later when `configure_env_origins` is called
         # private variables
         self._terrain_flat_patches = {}
+        # Keep the actual generator seed available for measurement compatibility on resume.
+        self.generation_seed: int | None = None
 
         # auto-import the terrain based on the config
         if self.cfg.terrain_type == "generator":
@@ -87,6 +89,7 @@ class TerrainImporter:
                 raise ValueError("Input terrain type is 'generator' but no value provided for 'terrain_generator'.")
             # generate the terrain
             terrain_generator = instantiate(self.cfg.terrain_generator, device=self.device)
+            self.generation_seed = terrain_generator.generation_seed
             self.import_mesh("terrain", terrain_generator.terrain_mesh)
             # Tag the terrain collider with its height-field resolution. Backends that
             # collide against heightfields (e.g. Newton) can swap the large collision

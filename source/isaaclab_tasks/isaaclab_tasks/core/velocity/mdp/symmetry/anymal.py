@@ -203,9 +203,9 @@ def _observation_symmetry(
             perm[3:190] = grid.flatten().tolist()
     else:
         sign[:9] = _PROPRIOCEPTIVE_SIGNS[kind]
-        # joint positions, joint velocities, and last actions
+        # joint positions, joint velocities, and all action history entries
         joint_perm, joint_sign = _joint_permutation(kind, joint_names)
-        for start in (9, 21, 33):
+        for start in range(9, num_obs, 12):
             perm[start : start + 12] = [start + joint for joint in joint_perm]
             sign[start : start + 12] = joint_sign
     return (

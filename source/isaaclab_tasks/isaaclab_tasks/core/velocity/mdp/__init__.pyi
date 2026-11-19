@@ -12,6 +12,7 @@ __all__ = [
     "feet_slide",
     "foot_alignment",
     "foot_misalignment",
+    "foot_separation_LR",
     "stand_still_joint_deviation_l1",
     "stand_still_foot_position_l2",
     "stand_still_contact",
@@ -21,6 +22,7 @@ __all__ = [
     "track_lin_vel_xy_yaw_frame_exp",
     "trot_gait_pattern",
     "variable_position",
+    "yaw_footplacement",
     "smoothness",
     "stand_still_joint_velocity",
 ]
@@ -37,6 +39,7 @@ from .rewards import (
     feet_slide,
     foot_alignment,
     foot_misalignment,
+    foot_separation_LR,
     smoothness,
     stand_still_contact,
     stand_still_foot_position_l2,
@@ -46,5 +49,6 @@ from .rewards import (
     track_lin_vel_xy_yaw_frame_exp,
     trot_gait_pattern,
     variable_position,
+    yaw_footplacement,
 )
 from .terminations import terrain_out_of_bounds

@@ -176,22 +176,22 @@ UNITREE_GO2_CFG = ArticulationCfg(
         ],
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.28),
+        pos=(0.0, 0.0, 0.30),
         joint_pos={
             "FL_hip_joint": 0.0,         # [rad]
             "FR_hip_joint": 0.0,         # [rad]
             "RL_hip_joint": 0.0,         # [rad]
             "RR_hip_joint": 0.0,         # [rad]
 
-            "FL_thigh_joint": 0.920,     # [rad] 
-            "FR_thigh_joint": 0.920,     # [rad]
-            "RL_thigh_joint": 0.920,     # [rad]
-            "RR_thigh_joint": 0.920,     # [rad]
+            "FL_thigh_joint": 0.865,     # [rad] 
+            "FR_thigh_joint": 0.865,     # [rad]
+            "RL_thigh_joint": 0.865,     # [rad]
+            "RR_thigh_joint": 0.865,     # [rad]
             
-            "FL_calf_joint": -1.850,     # [rad]
-            "FR_calf_joint": -1.850,     # [rad]
-            "RL_calf_joint": -1.850,     # [rad]
-            "RR_calf_joint": -1.850,     # [rad]
+            "FL_calf_joint": -1.729,     # [rad]
+            "FR_calf_joint": -1.729,     # [rad]
+            "RL_calf_joint": -1.729,     # [rad]
+            "RR_calf_joint": -1.729,     # [rad]
         },                               # 초기 자세(default_dof_pos)의 결과로 나오는 높이 = 목표 높이(base_height)인 것이 좋을 것임.  
         joint_vel={".*": 0.0},
     ),

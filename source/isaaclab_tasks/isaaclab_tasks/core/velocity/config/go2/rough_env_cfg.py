@@ -5,14 +5,21 @@
 
 """Configuration for the Unitree Go2 velocity-tracking environment on rough terrain."""
 
+import math
+
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass, replace
 
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
 from ... import mdp
-from ...velocity_env_cfg import LocomotionVelocityRoughEnvCfg, RewardsCfg
+from ...mdp.curriculum.success import SuccessTerrainCfg, SuccessTerrainCurriculum
+from ...mdp.curriculum.terminations import assigned_terrain_boundary
+from ...mdp.metrics import LocomotionMetricsCfg
+from ...velocity_env_cfg import LocomotionVelocityRoughEnvCfg, RewardsCfg, TerminationsCfg
 
 # UNITREE_GO2_CFG.init_state.pos is (0, 0, 0.28)
 _GO2_STANDING_HEIGHT = 0.28
@@ -46,10 +53,14 @@ class UnitreeGo2Rewards(RewardsCfg):
         params={"action_name": "joint_pos"},
     )
 
-    base_height_l2 = RewTerm(
-        func=mdp.base_height_l2,
+    base_height = RewTerm(
+        func=mdp.base_height_exp,
         weight=0.0,
-        params={"target_height": _GO2_STANDING_HEIGHT},
+        params={
+            "target_height": _GO2_STANDING_HEIGHT,
+            "height_sigma": 0.005,
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+        },
     )
 
     trot_gait_pattern = RewTerm(
@@ -69,25 +80,21 @@ class UnitreeGo2Rewards(RewardsCfg):
         },
     )
 
-    stand_still_joint_position = RewTerm(
-        func=mdp.stand_still_joint_deviation_l1,
+    feet_clearance = RewTerm(
+        func=mdp.feet_clearance,
         weight=0.0,
         params={
             "command_name": "base_velocity",
             "command_threshold": 0.05,
-            "asset_cfg": SceneEntityCfg("robot"),
-        },
-    )
-
-    stand_still_contact = RewTerm(
-        func=mdp.stand_still_contact,
-        weight=0.0,
-        params={
-            "command_name": "base_velocity",
-            "command_threshold": 0.05,
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
+            "target_height": 0.08,
+            "min_foot_speed": 0.05,
+            # Use world Z = 0 only when no terrain rays hit; Flat disables the sensor.
+            "plane_z": 0.0,
+            "height_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
                 body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
             ),
         },
     )
@@ -137,6 +144,41 @@ class UnitreeGo2Rewards(RewardsCfg):
         },
     )
 
+    foot_alignment = RewTerm(
+        func=mdp.foot_alignment,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+            "min_foot_speed": 0.03,
+            "contact_threshold": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+            ),
+        },
+    )
+
+    foot_misalignment = RewTerm(
+        func=mdp.foot_misalignment,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+            "min_foot_speed": 0.03,
+            "min_base_speed": 0.05,
+            "contact_threshold": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+            ),
+        },
+    )
+
     variable_position = RewTerm(
         func=mdp.variable_position,
         weight=0.0,
@@ -156,13 +198,33 @@ class UnitreeGo2Rewards(RewardsCfg):
                 ".*_calf_joint": 0.15,
             },
             "std_moving": {
-                ".*_hip_joint": 0.15,
-                ".*_thigh_joint": 0.35,
-                ".*_calf_joint": 0.5,
+                ".*_hip_joint": 0.25,  # 0.15
+                ".*_thigh_joint": 0.60,  # 0.35
+                ".*_calf_joint": 0.50,
             },
             "command_threshold": 0.05,
         },
     )
+
+    yaw_footplacement = RewTerm(
+        func=mdp.yaw_footplacement,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+        },
+    )
+
+
+@configclass
+class UnitreeGo2TerminationsCfg(TerminationsCfg):
+    """Go2의 몸통 기울기가 90도를 초과하면 속도 추종 실패로 종료함.
+
+    몸통 +Z축과 월드 +Z축 사이의 전체 기울기를 사용하며 접촉 여부와 독립적으로 평가함.
+    평지·험지에 공통 적용하며, 기울기가 큰 상태로 action을 계속 출력하는 구간을 차단함.
+    """
+
+    bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": math.radians(90.0)})
 
 
 @configclass
@@ -189,11 +251,16 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     # --- rewards ---
     rewards: UnitreeGo2Rewards = UnitreeGo2Rewards()
 
+    # --- termination ---
+    terminations: UnitreeGo2TerminationsCfg = UnitreeGo2TerminationsCfg()
+
+    # Physical gait and tracking telemetry, independent of rewards and curriculum.
+    locomotion_metrics: LocomotionMetricsCfg = LocomotionMetricsCfg()
+
     def __post_init__(self):
         super().__post_init__()
 
         # simulation
-        # execute the DC motor actuators through the backend-native path
         self.sim.use_newton_actuators = True
 
         # scene
@@ -203,29 +270,73 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # scale down the terrains because the robot is small
         terrains = self.scene.terrain.terrain_generator.sub_terrains
         terrains["boxes"].grid_height_range = (0.025, 0.1)
+        terrains["pyramid_stairs"].step_height_range = (0.05, 0.20)
+        terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.20)
         terrains["random_rough"].noise_range = (0.01, 0.06)
         terrains["random_rough"].noise_step = 0.01
-        terrains["pyramid_stairs"].step_height_range = (0.025, 0.12)
-        terrains["pyramid_stairs_inv"].step_height_range = (0.025, 0.12)
 
-        # actions
+        # Use two-trial success histories to update terrain difficulty.
+        self.curriculum.learning_progress = None
+        self.curriculum.terrain_levels = CurrTerm(
+            func=SuccessTerrainCurriculum, params={"settings": SuccessTerrainCfg()}
+        )
+        self.commands.base_velocity = replace(
+            self.commands.base_velocity,
+            class_type=mdp.UniformVelocityCommand,
+            rel_standing_envs=0.025,
+            rel_rotating_envs=0.025,
+            rel_transition_envs=0.0,
+            heading_command=False,
+        )
+        self.scene.terrain.terrain_generator.curriculum = True
+        self.terminations.assigned_terrain_boundary = DoneTerm(func=assigned_terrain_boundary, time_out=True)
+
+        # --- actions ---
         self.actions.joint_pos.scale = 0.25
 
-        # rewards
-        self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"
-        self.rewards.feet_air_time.weight = 0.01
-        self.rewards.dof_torques_l2.weight = -0.0002
-        self.rewards.track_lin_vel_xy_exp.weight = 1.5
-        self.rewards.track_ang_vel_z_exp.weight = 0.75
-        self.rewards.dof_acc_l2.weight = -2.5e-7
+        # -- commands ---
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)  # x, m/s
+        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)  # y, m/s
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)  # yaw, rad/s
 
-        # base_height_l2: rough terrain, adjust target height using the height-scanner rays.
-        self.rewards.base_height_l2.weight = -30.0
-        self.rewards.base_height_l2.params["sensor_cfg"] = SceneEntityCfg("height_scanner")
+        # --- rewards ---
+        # tasks
+        self.rewards.track_lin_vel_xy_exp.weight = 3.0
+        self.rewards.track_ang_vel_z_exp.weight = 1.5
 
-        # action_rate_l2: halved from the shared default of -0.01. The stronger penalty locked
-        # one hind foot into a low-amplitude, dragging gait on flat terrain with Newton.
-        self.rewards.action_rate_l2.weight = -0.005
+        self.rewards.termination.weight = -1.0
+        self.rewards.collisions.weight = -1.0  # -1.0 에서 변경
+        # --> collision = 0.0 변경 시, iteration time이 커지는 경향 발생.
+        self.rewards.dof_pos_limits.weight = -10.0
+        self.rewards.dof_vel_limits.weight = -10.0
+        self.rewards.dof_acc_l2.weight = -4.5e-7  # -4.5e-7 에서 변경
+        self.rewards.dof_torques_l2.weight = -0.0001
+
+        self.rewards.stand_still_contact.weight = -0.5
+        self.rewards.stand_still_foot_position.weight = -10.0
+
+        self.rewards.flat_orientation_l2.weight = -0.0  # -5.0
+        self.rewards.ang_vel_xy_l2.weight = -0.1    # 0.5
+        self.rewards.action_rate_l2.weight = -0.01
+        self.rewards.smoothness.weight = -0.01
+        # self.rewards.base_height.weight = 2.0
+
+        self.rewards.variable_position.weight = 1.0
+        self.rewards.trot_gait_pattern.weight = 0.5
+        self.rewards.feet_air_time.weight = 1.0
+        self.rewards.feet_air_time_variance.weight = -1.0
+        # self.rewards.feet_slide.weight = -0.1
+        self.rewards.feet_clearance.weight = -5.0
+        self.rewards.foot_alignment.weight = 0.05
+        self.rewards.foot_misalignment.weight = -0.05
 
         # terminations
         self.terminations.base_contact.params["sensor_cfg"].body_names = "base"
+
+    def play_mode(self):
+        """Use ordinary velocity commands for interactive policy playback."""
+        super().play_mode()
+        self.curriculum.terrain_levels = None
+        self.curriculum.learning_progress = None
+        self.commands.base_velocity.class_type = mdp.UniformVelocityCommand
+        self.terminations.assigned_terrain_boundary = None

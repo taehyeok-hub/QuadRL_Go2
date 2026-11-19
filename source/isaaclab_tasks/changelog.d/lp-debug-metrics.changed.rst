@@ -1,0 +1,1 @@
+* Limit default learning-progress logs to tracking, failure, coverage, and terrain sampling metrics; enable detailed combinations with ``debug_metrics=True`` without invalidating existing curriculum checkpoints.

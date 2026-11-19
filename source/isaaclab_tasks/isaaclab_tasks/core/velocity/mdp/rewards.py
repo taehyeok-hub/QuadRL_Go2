@@ -37,6 +37,7 @@ def base_height_exp(
     target_height: float,
     height_sigma: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """몸통 높이가 목표 높이에 가까울수록 지수 보상을 반환함.
 
@@ -46,14 +47,15 @@ def base_height_exp(
 
     Args:
         env: 보상을 계산할 강화학습 환경임.
-        target_height: 평지 지면이 월드 Z=0일 때의 목표 몸통 높이.
+        target_height: 지면으로부터의 목표 몸통 높이. 센서가 없으면 월드 Z=0을 기준으로 함.
         height_sigma: 높이 오차 제곱을 나누는 양의 민감도 계수이며 단위는 m²임. not std, 수식의 분모에 직접 사용하는 값.
         asset_cfg: 몸통 높이를 읽을 로봇의 선택 설정임.
+        sensor_cfg: 지형 높이를 보정할 높이 스캐너. 유효한 레이의 평균 높이를 사용함.
 
     Returns:
         환경별 지수 보상이며, 가중치와 시간 배율을 적용하기 전의 값임.
     """
-    height_error = mdp.base_height_l2(env, target_height=target_height, asset_cfg=asset_cfg)
+    height_error = mdp.base_height_l2(env, target_height=target_height, asset_cfg=asset_cfg, sensor_cfg=sensor_cfg)
     return torch.exp(-height_error / height_sigma)
 
 
@@ -172,61 +174,107 @@ def feet_air_time_variance(
 
 
 class trot_gait_pattern(ManagerTermBase):
-    """대각선 지지를 보상하고, 대각선 사용 편향과 공중 상태를 감점하는 함수 클래스"""
+    """대각선 조합(1)과 이륙·착지 동기화(2)를 유도하고 같은 짝의 반복 사용(3)을 감점함.
+
+    보행 주기나 목표 위상을 미리 지정하지 않고 실제 접촉 상태를 평가함.
+    기존 접촉 기준인 Fz > 1 N을 시간 누적에도 동일하게 적용함.
+    """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
 
-        if not 0.0 <= cfg.params["ema_alpha"] < 1.0:
-            raise ValueError("ema_alpha는 0 이상, 1 미만이어야 합니다.")
-
-        # 양수: FL/RR 편향, 음수: FR/RL 편향, 0: 균형
+        # 접촉·스윙 시간과 대각짝 사용 이력을 환경별로 저장함.
         self.diagonal_bias = torch.zeros(env.num_envs, device=env.device)
+        # -->  양수: FL/RR 편향, 음수: FR/RL 편향, 0: 균형
+        # -->  최근 사용 이력을 EMA로 누적해서 한쪽 대각짝에 치우치는 것을 줄임.
+        self.air_time = torch.zeros(env.num_envs, 4, device=env.device)
+        self.contact_time = torch.zeros_like(self.air_time)
 
-    def reset(
-        self,
-        env_ids: Sequence[int] | torch.Tensor | slice | None = None,
-    ) -> None:
+    def reset(self, env_ids=None):
+        """지정한 환경의 접촉 시간과 사용 편향을 초기화함."""
         selected = slice(None) if env_ids is None else env_ids
-        self.diagonal_bias[selected] = 0.0
+
+        for buffer in (
+            self.diagonal_bias,
+            self.air_time,
+            self.contact_time,
+        ):
+            buffer[selected] = 0
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
         command_name: str,
         sensor_cfg: SceneEntityCfg,
+        pair_weight: float = 1.0,
+        sync_weight: float = 0.5,
+        sync_tolerance: float = 0.04,  # 이륙·착지 시간 차이를 얼마나 엄격하게 감점할지 정하는 값
         airborne_penalty: float = 1.0,
         balance_weight: float = 0.5,
         ema_alpha: float = 0.99,
         command_threshold: float = 0.05,
     ) -> torch.Tensor:
+        if sync_tolerance <= 0:
+            raise ValueError("sync_tolerance는 양수여야 함.")
+        if not 0.0 <= ema_alpha < 1.0:
+            raise ValueError("ema_alpha는 0 이상, 1 미만이어야 함.")
+
+        # 접촉 상태와 이동 명령을 확인함.
         contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
         contact = contact_sensor.data.net_normal_forces_w.torch[:, sensor_cfg.body_ids, 2] > 1.0
-
         if contact.shape[1] != 4:
-            raise ValueError("발을 FL, FR, RL, RR 순서로 정확히 4개 선택해야 합니다.")
-
-        fl, fr, rl, rr = contact.unbind(dim=1)
-        pair_a = fl & rr & ~fr & ~rl
-        pair_b = fr & rl & ~fl & ~rr
-        valid_pair = pair_a | pair_b
+            raise ValueError("발을 FL, FR, RL, RR 순서로 정확히 4개 선택해야 함.")
 
         commands = env.command_manager.get_command(command_name)
         moving = (torch.linalg.vector_norm(commands[:, :2], dim=1) > command_threshold) | (
             commands[:, 2].abs() > command_threshold
         )
 
-        # 이동 중 유효한 대각선 지지가 관측될 때만 EMA 갱신
+        # 현재 스윙·지지 시간을 같은 접촉 기준으로 누적함. 정지 명령에서는 시간을 초기화함.
+        self.air_time.copy_(
+            torch.where(~contact, self.air_time + env.step_dt, 0.0)  # 발이 떠있으면 air_time 증가, contact_time=0
+        )
+        self.contact_time.copy_(
+            torch.where(contact, self.contact_time + env.step_dt, 0.0)  # 발이 접촉하면 contact_time 증가, air_time=0
+        )
+
+        # 대각선 두 발만 지지하는 조합을 보상함.
+        fl, fr, rl, rr = contact.unbind(dim=1)
+        pair_a = fl & rr & ~fr & ~rl
+        pair_b = fr & rl & ~fl & ~rr
+        valid_pair = pair_a | pair_b
+        pair_reward = (valid_pair & moving).float()
+
+        # 대각짝의 이륙·착지 시점 차이가 클수록 감점함.
+        # --> 두 발이 같은 상태일 때 진행 시간 차이는 시작 시점 차이에 해당함.
+        # --> 유효한 대각선 조합에서만 동기화 오차를 반영함.
+        sync_error = (
+            (self.air_time[:, 0] - self.air_time[:, 3]).abs()
+            + (self.air_time[:, 1] - self.air_time[:, 2]).abs()
+            + (self.contact_time[:, 0] - self.contact_time[:, 3]).abs()
+            + (self.contact_time[:, 1] - self.contact_time[:, 2]).abs()
+        )
+        sync_score = torch.exp(-sync_error / sync_tolerance)
+        sync_penalty = pair_reward * (1.0 - sync_score)
+
+        # EMA로 한쪽 대각짝의 사용 편향을 감점함.
+        # --> 이동 중 유효한 대각선 지지가 관측될 때만 EMA 갱신
         target_bias = pair_a.float() - pair_b.float()
         updated_bias = ema_alpha * self.diagonal_bias + (1.0 - ema_alpha) * target_bias
-        self.diagonal_bias.copy_(torch.where(moving & valid_pair, updated_bias, self.diagonal_bias))
+        updated_bias = torch.where(valid_pair, updated_bias, self.diagonal_bias)
 
-        all_airborne = ~contact.any(dim=1)
+        # --> 정지했을 때에도 정지 전에 어느 대각짝을 많이 사용했는지 기억한 상태로 EMA 계산을 이어감.
+        self.diagonal_bias.copy_(torch.where(moving, updated_bias, self.diagonal_bias))
+        balance_penalty = self.diagonal_bias.abs() * moving.float()
+
+        # 네 발이 모두 공중에 있는 상태를 감점함.
+        all_airborne = (~contact.any(dim=1)).float()
 
         return (
-            (valid_pair & moving).float()
-            - balance_weight * self.diagonal_bias.abs() * moving.float()
-            - airborne_penalty * all_airborne.float()
+            pair_weight * pair_reward
+            - sync_weight * sync_penalty
+            - balance_weight * balance_penalty
+            - airborne_penalty * all_airborne
         )
 
 
@@ -265,10 +313,13 @@ def feet_clearance(
     plane_z: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     command_threshold: float = 0.05,
+    height_sensor_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """평면 위에서 움직이는 발 링크 원점의 높이 오차에 수평 속력을 가중한 비용을 반환한다.
+    """움직이는 발 링크 원점의 지면 상대 높이 오차에 수평 속력을 가중한 비용을 반환한다.
 
-    발 높이는 발 링크 원점의 월드 Z 위치에서 ``plane_z``를 뺀 값이다.
+    센서가 없으면 발의 월드 Z 위치에서 ``plane_z``를 뺀다. 높이 스캐너가 있으면
+    각 발의 월드 XY에 가장 가까운 유효한 레이의 지면 높이를 사용한다.
+    이는 스캔 격자 해상도에 따른 근사이며, 모든 레이가 누락되면 ``plane_z``로 돌아간다.
     수평 선속력도 월드 좌표계의 발 링크 원점을 기준으로 계산한다.
     각 발의 수평 속력이 ``min_foot_speed`` 이상일 때만 높이 오차의 제곱에
     해당 발의 실제 수평 속력 전체를 곱한다. 발별 비용을 합산하며, 정지 명령에서는 0을 반환한다.
@@ -276,17 +327,31 @@ def feet_clearance(
     Args:
         env: 환경 인스턴스.
         command_name: 평면 선속도와 yaw 각속도 명령을 제공하는 명령 항의 이름.
-        target_height: 평면 지면으로부터 발 링크 원점까지의 목표 높이. 단위는 m.
+        target_height: 지면으로부터 발 링크 원점까지의 목표 높이. 단위는 m.
         min_foot_speed: 발별 비용을 계산하기 위한 최소 수평 선속력. 단위는 m/s.
-        plane_z: 평면 지면의 월드 Z 좌표. 단위는 m.
+        plane_z: 센서가 없거나 모든 레이가 누락됐을 때 사용할 지면의 월드 Z 좌표. 단위는 m.
         asset_cfg: 평가할 로봇과 발 링크를 선택하는 설정.
         command_threshold: 평면 명령 속력과 yaw 각속도 명령의 크기에 각각 적용하는 이동 판정 임계값.
+        height_sensor_cfg: 발마다 가까운 지면 높이 샘플을 제공할 높이 스캐너.
 
     Returns:
         환경별 0 이상의 비용을 담은 ``(num_envs,)`` 형태의 텐서. 보상 설정에서 음수 가중치를 적용한다.
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    foot_height = asset.data.body_link_pos_w.torch[:, asset_cfg.body_ids, 2] - plane_z
+    foot_pos_w = asset.data.body_link_pos_w.torch[:, asset_cfg.body_ids]
+    if height_sensor_cfg is not None:
+        sensor = env.scene[height_sensor_cfg.name]
+        ray_hits_w = sensor.data.ray_hits_w.torch
+        finite_hits = torch.isfinite(ray_hits_w).all(dim=-1)
+        safe_hits = torch.where(finite_hits[..., None], ray_hits_w, 0.0)
+        distance_xy = (foot_pos_w[:, :, None, :2] - safe_hits[:, None, :, :2]).square().sum(dim=-1)
+        distance_xy = distance_xy.masked_fill(~finite_hits[:, None, :], float("inf"))
+        nearest_hit = distance_xy.argmin(dim=-1)
+        terrain_height = safe_hits[..., 2].gather(1, nearest_hit)
+        ground_height = torch.where(finite_hits.any(dim=1, keepdim=True), terrain_height, plane_z)
+    else:
+        ground_height = plane_z
+    foot_height = foot_pos_w[..., 2] - ground_height
     foot_vel_xy = asset.data.body_link_lin_vel_w.torch[:, asset_cfg.body_ids, :2]
     foot_speed_xy = torch.linalg.vector_norm(foot_vel_xy, dim=-1)
 
@@ -294,6 +359,88 @@ def feet_clearance(
     cost = torch.where(foot_speed_xy >= min_foot_speed, per_foot_cost, 0.0).sum(dim=1)
     command = env.command_manager.get_command(command_name)
     return cost * _is_moving_command(command, command_threshold)
+
+
+def foot_separation_LR(
+    env: ManagerBasedRLEnv,
+    min_distance: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """인접한 발 쌍의 수평 거리가 최소 간격보다 짧을 때 선형 비용을 반환함.
+
+    quadflat_lab과 동일하게 FL-FR, RL-RR, FL-RL, FR-RR 네 쌍만 평가하며 대각선 쌍은 제외함.
+    각 쌍에 max(min_distance - distance_xy, 0)을 적용하고 합산하므로 최소 간격 이상에서는 비용이 0임.
+    수평 거리는 yaw 회전과 원점 이동에 불변이므로 발 링크 원점의 월드 XY 위치를 그대로 사용함.
+    발 높이와 접촉 상태는 사용하지 않으며, 이동·정지·회전 명령 모두에서 적용함.
+    발이 가까워지는 동작을 감점하는 보상 항이며, 최소 간격을 물리적으로 보장하는 제약은 아님.
+    원본의 최소 간격은 0.15 m이고, 가중치 -10과 제어 시간 배율은 RewardManager에서 별도로 적용함.
+
+    Args:
+        env: 보상을 계산할 강화학습 환경임.
+        min_distance: 발 링크 원점 사이에 요구하는 최소 수평 간격이며 단위는 m임.
+        asset_cfg: 로봇과 네 발을 FL, FR, RL, RR 순서로 선택하는 설정임.
+
+    Returns:
+        가중치와 시간 배율 적용 전의 환경별 0 이상 비용이며, 형태는 (num_envs,)임.
+
+    Raises:
+        ValueError: 평가할 발 링크를 정확히 네 개 선택하지 않은 경우 발생함.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_xy = asset.data.body_link_pos_w.torch[:, asset_cfg.body_ids, :2]
+    if foot_xy.shape[1] != 4:
+        raise ValueError("발을 FL, FR, RL, RR 순서로 정확히 4개 선택해야 함.")
+
+    pair_distances = torch.stack(
+        (
+            torch.linalg.vector_norm(foot_xy[:, 0] - foot_xy[:, 1], dim=1),
+            torch.linalg.vector_norm(foot_xy[:, 2] - foot_xy[:, 3], dim=1),
+            torch.linalg.vector_norm(foot_xy[:, 0] - foot_xy[:, 2], dim=1),
+            torch.linalg.vector_norm(foot_xy[:, 1] - foot_xy[:, 3], dim=1),
+        ),
+        dim=1,
+    )
+    return (min_distance - pair_distances).clamp(min=0.0).sum(dim=1)
+
+
+def yaw_footplacement(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    linear_command_threshold: float = 0.1,
+    yaw_command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """제자리 회전 명령에서 발의 전후·수직 속도 절댓값을 합산한 비용을 반환함.
+
+    quadflat_lab과 동일하게 발 링크 원점의 월드 선속도에서 몸통의 yaw 회전만 제거함.
+    roll과 pitch는 제거하지 않으며, 발 속도에서 몸통 선속도나 회전에 따른 속도를 빼지 않음.
+    평면 선속도 명령의 크기가 linear_command_threshold 미만이고,
+    yaw 각속도 명령의 절댓값이 yaw_command_threshold를 초과할 때만 적용함.
+    접촉 여부와 관계없이 선택한 모든 발의 abs(v_x) + abs(v_z)를 합산함.
+    RewardTermCfg의 weight=-0.5로 설정하면 원본의 감점 수식과 같으며, 시간 배율도 RewardManager에서 적용함.
+    발의 수직 움직임을 줄이도록 유도할 수 있지만, 목표 발 높이나 스텝 횟수를 직접 지정하는 항은 아님.
+
+    Args:
+        env: 보상을 계산할 강화학습 환경임.
+        command_name: 몸통 기준 vx, vy, yaw 각속도 명령을 제공하는 명령 항의 이름임.
+        asset_cfg: 속도를 평가할 로봇과 발 링크를 선택하는 설정임.
+        linear_command_threshold: 제자리 회전으로 인정할 평면 명령 속력의 상한이며 단위는 m/s임.
+        yaw_command_threshold: 회전을 활성화할 yaw 각속도 명령의 하한이며 단위는 rad/s임.
+
+    Returns:
+        가중치와 시간 배율 적용 전의 환경별 0 이상 비용이며, 형태는 (num_envs,)임.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_velocity_w = asset.data.body_link_lin_vel_w.torch[:, asset_cfg.body_ids]
+    heading = yaw_quat(asset.data.root_quat_w.torch)[:, None, :]
+    foot_velocity_heading = quat_apply_inverse(heading, foot_velocity_w)
+    cost = (foot_velocity_heading[..., 0].abs() + foot_velocity_heading[..., 2].abs()).sum(dim=1)
+
+    command = env.command_manager.get_command(command_name)
+    yaw_only = (torch.linalg.vector_norm(command[:, :2], dim=1) < linear_command_threshold) & (
+        command[:, 2].abs() > yaw_command_threshold
+    )
+    return cost * yaw_only
 
 
 def _swing_foot_direction_score(
@@ -457,6 +604,59 @@ def stand_still_joint_deviation_l1(
     return mdp.joint_deviation_l1(env, asset_cfg) * standing
 
 
+def stand_still_joint_velocity(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    velocity_sigma: float,
+    command_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize normalized joint velocities during standing commands."""
+    if velocity_sigma <= 0.0:
+        raise ValueError("velocity_sigma must be positive.")
+
+    # 평면 이동과 yaw 회전 명령이 모두 작을 때 정지로 판정.
+    command = env.command_manager.get_command(command_name)
+    standing = (torch.linalg.vector_norm(command[:, :2], dim=1) < command_threshold) & (
+        command[:, 2].abs() < command_threshold
+    )
+
+    # 선택된 관절의 현재 속도. 단위: rad/s.
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel = asset.data.joint_vel.torch[:, asset_cfg.joint_ids]
+
+    # 관절 수에 영향을 덜 받도록 합 대신 평균 사용.
+    normalized_velocity = joint_vel / velocity_sigma
+    penalty = normalized_velocity.square().mean(dim=1)
+
+    return penalty * standing.to(penalty.dtype)
+
+
+def stand_still_contact(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    command_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize missing foot contacts during standing commands.
+
+    The sensor must select exactly four feet.
+    """
+    # Count feet whose current world-Z contact force exceeds the threshold.
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact = contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids, 2] > 1.0
+    num_contact = contact.float().sum(dim=1)
+    penalty = torch.square(4.0 - num_contact)
+
+    # Require both translation and yaw commands to be small.
+    command = env.command_manager.get_command(command_name)
+    standing = (torch.linalg.vector_norm(command[:, :2], dim=1) < command_threshold) & (
+        command[:, 2].abs() < command_threshold
+    )
+
+    return penalty * standing.float()
+
+
 def stand_still_foot_position_l2(
     env,
     command_name: str,
@@ -493,31 +693,6 @@ def stand_still_foot_position_l2(
     )
 
     return penalty * standing.to(penalty.dtype)
-
-
-def stand_still_contact(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    sensor_cfg: SceneEntityCfg,
-    command_threshold: float = 0.05,
-) -> torch.Tensor:
-    """Penalize missing foot contacts during standing commands.
-
-    The sensor must select exactly four feet.
-    """
-    # Count feet whose current world-Z contact force exceeds the threshold.
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    contact = contact_sensor.data.net_forces_w.torch[:, sensor_cfg.body_ids, 2] > 1.0
-    num_contact = contact.float().sum(dim=1)
-    penalty = torch.square(4.0 - num_contact)
-
-    # Require both translation and yaw commands to be small.
-    command = env.command_manager.get_command(command_name)
-    standing = (torch.linalg.vector_norm(command[:, :2], dim=1) < command_threshold) & (
-        command[:, 2].abs() < command_threshold
-    )
-
-    return penalty * standing.float()
 
 
 class variable_position(ManagerTermBase):
@@ -617,31 +792,3 @@ class smoothness(ManagerTermBase):
         self._prev_action.copy_(action)
 
         return penalty
-
-
-def stand_still_joint_velocity(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    velocity_sigma: float,
-    command_threshold: float = 0.05,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Penalize normalized joint velocities during standing commands."""
-    if velocity_sigma <= 0.0:
-        raise ValueError("velocity_sigma must be positive.")
-
-    # 평면 이동과 yaw 회전 명령이 모두 작을 때 정지로 판정.
-    command = env.command_manager.get_command(command_name)
-    standing = (torch.linalg.vector_norm(command[:, :2], dim=1) < command_threshold) & (
-        command[:, 2].abs() < command_threshold
-    )
-
-    # 선택된 관절의 현재 속도. 단위: rad/s.
-    asset: Articulation = env.scene[asset_cfg.name]
-    joint_vel = asset.data.joint_vel.torch[:, asset_cfg.joint_ids]
-
-    # 관절 수에 영향을 덜 받도록 합 대신 평균 사용.
-    normalized_velocity = joint_vel / velocity_sigma
-    penalty = normalized_velocity.square().mean(dim=1)
-
-    return penalty * standing.to(penalty.dtype)

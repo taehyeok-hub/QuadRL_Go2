@@ -894,6 +894,26 @@ def last_action(env: ManagerBasedEnv, action_name: str | None = None) -> torch.T
         return env.action_manager.get_term(action_name).raw_actions
 
 
+@generic_io_descriptor(dtype=torch.float32, observation_type="Action", on_inspect=[record_shape])
+def action_history(env: ManagerBasedEnv, index: int) -> torch.Tensor:
+    """Return an input action from the three-step action history.
+
+    Args:
+        env: The environment containing the action manager.
+        index: Steps before the most recently processed action: 0, 1, or 2.
+
+    Returns:
+        Raw input actions, zeroed for environments that have just reset.
+
+    Raises:
+        ValueError: If the history index is outside the supported range.
+    """
+    if index not in (0, 1, 2):
+        raise ValueError(f"Action history index must be 0, 1, or 2, received: {index}.")
+    manager = env.action_manager
+    return (manager.action, manager.prev_action, manager.prev_prev_action)[index]
+
+
 """
 Commands.
 """

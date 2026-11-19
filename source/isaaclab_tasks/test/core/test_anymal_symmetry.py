@@ -60,7 +60,7 @@ def _reference_obs(obs: torch.Tensor, kind: str, group_name: str, height_scan: b
     else:
         for block, sign in enumerate(signs[1:]):
             obs[:, 3 * block : 3 * block + 3] *= torch.tensor(sign)
-        for start in (9, 21, 33):
+        for start in (9, 21, 33, 45, 57):
             obs[:, start : start + 12] = _reference_joints(obs[:, start : start + 12], kind)
     return obs
 
@@ -95,8 +95,8 @@ def test_compute_symmetric_states_matches_reference(height_scan: bool):
     num_envs = 5
     obs = TensorDict(
         {
-            "actor_obs": torch.randn(num_envs, 45),
-            "critic_base_obs": torch.randn(num_envs, 45),
+            "actor_obs": torch.randn(num_envs, 69),
+            "critic_base_obs": torch.randn(num_envs, 69),
             "privileged_obs": torch.randn(num_envs, 190 if height_scan else 3),
         },
         batch_size=[num_envs],

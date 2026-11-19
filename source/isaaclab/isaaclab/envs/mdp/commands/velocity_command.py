@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -65,8 +66,10 @@ class UniformVelocityCommand(CommandTerm):
             raise ValueError("rel_standing_envs must be in [0, 1].")
         if not 0.0 <= self.cfg.rel_rotating_envs <= 1.0:
             raise ValueError("rel_rotating_envs must be in [0, 1].")
-        if self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs > 1.0:
-            raise ValueError("rel_standing_envs + rel_rotating_envs must be <= 1.")
+        if not 0.0 <= self.cfg.rel_transition_envs <= 1.0:
+            raise ValueError("rel_transition_envs must be in [0, 1].")
+        if self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs + self.cfg.rel_transition_envs > 1.0:
+            raise ValueError("rel_standing_envs + rel_rotating_envs + rel_transition_envs must be <= 1.")
         if self.cfg.heading_command and self.cfg.ranges.heading is None:
             raise ValueError(
                 "The velocity command has heading commands active (heading_command=True) but the `ranges.heading`"
@@ -89,6 +92,17 @@ class UniformVelocityCommand(CommandTerm):
         self.is_heading_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.is_standing_env = torch.zeros_like(self.is_heading_env)
         self.is_rotating_env = torch.zeros_like(self.is_heading_env)
+        # 전환 환경과 역할은 한 번만 배정하며, 에피소드 리셋에서도 유지함.
+        self.is_transition_env = torch.zeros_like(self.is_heading_env)
+        self.transition_type = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._num_transition_envs = round(self.num_envs * self.cfg.rel_transition_envs)
+        if (
+            self._num_transition_envs / self.num_envs + self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs
+            > 1.0 + 1.0e-12
+        ):
+            raise ValueError("The rounded transition quota leaves insufficient environments for standing/rotating.")
+        if self.cfg.rel_transition_envs > 0.0:
+            self._initialize_transition_envs()
         # -- metrics: finalized per-episode means/rates, written at reset() and read by the base class
         self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
@@ -112,6 +126,9 @@ class UniformVelocityCommand(CommandTerm):
         if self.cfg.heading_command:
             msg += f"\tHeading probability: {self.cfg.rel_heading_envs}\n"
         msg += f"\tStanding probability: {self.cfg.rel_standing_envs}"
+        if self._num_transition_envs:
+            msg += f"\n\tFixed transition environments: {self._num_transition_envs}/{self.num_envs}"
+            msg += f"\n\tTransition resampling time range: {self.cfg.transition_resampling_time_range}"
         return msg
 
     """
@@ -136,6 +153,8 @@ class UniformVelocityCommand(CommandTerm):
         self._error_xy_sum += error_xy
         self._error_yaw_sum += error_yaw
         self._step_count += 1.0
+        if self._num_transition_envs:
+            self._update_transition_metrics(error_xy, error_yaw)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, torch.Tensor]:
         # Finalize the just-ended episode's metrics into ``self.metrics`` BEFORE the base
@@ -152,6 +171,7 @@ class UniformVelocityCommand(CommandTerm):
         self.metrics["success_rate"][env_ids] = (
             (mean_error_xy < self.cfg.vel_xy_success_threshold) & (mean_error_yaw < self.cfg.vel_yaw_success_threshold)
         ).float()
+        transition_metrics = self._reset_transition_metrics(env_ids) if self._num_transition_envs else {}
         extras = super().reset(env_ids)
         # Route success_rate to the unified ``Metrics/success_rate`` path (shared TensorBoard
         # / wandb card across tasks); pop it from the returned dict so CommandManager does
@@ -160,6 +180,7 @@ class UniformVelocityCommand(CommandTerm):
         index_fill_(self._error_xy_sum, env_ids, 0.0)
         index_fill_(self._error_yaw_sum, env_ids, 0.0)
         index_fill_(self._step_count, env_ids, 0.0)
+        extras.update(transition_metrics)
         return extras
 
     def _resample_command(self, env_ids: Sequence[int]):
@@ -179,10 +200,12 @@ class UniformVelocityCommand(CommandTerm):
             self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
         # Select mutually exclusive standing and rotating environments.
         mode = r.uniform_(0.0, 1.0)
+        if self._num_transition_envs:
+            # 전환 환경을 제외한 집단에서 추첨하되, 기존 비율은 전체 환경 기준으로 유지함.
+            mode *= (self.num_envs - self._num_transition_envs) / self.num_envs
         self.is_standing_env[env_ids] = mode < self.cfg.rel_standing_envs
-        self.is_rotating_env[env_ids] = (
-            (mode >= self.cfg.rel_standing_envs)
-            & (mode < self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs)
+        self.is_rotating_env[env_ids] = (mode >= self.cfg.rel_standing_envs) & (
+            mode < self.cfg.rel_standing_envs + self.cfg.rel_rotating_envs
         )
 
         # Apply rotation constraints immediately, including after a reset.
@@ -190,6 +213,8 @@ class UniformVelocityCommand(CommandTerm):
             self.vel_command_b[env_ids, :2] = self.vel_command_b[env_ids, :2].masked_fill(
                 self.is_rotating_env[env_ids].unsqueeze(-1), 0.0
             )
+        if self._num_transition_envs:
+            self._resample_transition_commands(env_ids)
 
     def _update_command(self):
         """Apply heading control and standing or rotating constraints."""
@@ -202,7 +227,7 @@ class UniformVelocityCommand(CommandTerm):
                 max=self.cfg.ranges.ang_vel_z[1],
             )
             self.vel_command_b[:, 2] = torch.where(
-                self.is_heading_env & ~self.is_rotating_env,
+                self.is_heading_env & ~self.is_rotating_env & ~self.is_transition_env,
                 heading_ang_vel,
                 self.vel_command_b[:, 2],
             )
@@ -213,6 +238,173 @@ class UniformVelocityCommand(CommandTerm):
 
         # Standing environments have zero velocity in all components.
         index_fill_(self.vel_command_b, self.is_standing_env, 0.0)
+
+    def _initialize_transition_envs(self) -> None:
+        """고정 전환 환경과 여섯 역할, 명령 패턴 및 전환 지표 버퍼를 준비함."""
+        lower, upper = self.cfg.transition_resampling_time_range
+        if not (math.isfinite(lower) and math.isfinite(upper) and 0.0 < lower <= upper):
+            raise ValueError("transition_resampling_time_range must be finite and satisfy 0 < lower <= upper.")
+        for name, (lower, upper) in (
+            ("lin_vel_x", self.cfg.ranges.lin_vel_x),
+            ("lin_vel_y", self.cfg.ranges.lin_vel_y),
+            ("ang_vel_z", self.cfg.ranges.ang_vel_z),
+        ):
+            if not (math.isfinite(lower) and math.isfinite(upper) and lower < 0.0 < upper):
+                raise ValueError(f"Transition commands require finite {name} limits satisfying lower < 0 < upper.")
+
+        self._transition_env_ids = torch.randperm(self.num_envs, device=self.device)[: self._num_transition_envs]
+        self.is_transition_env[self._transition_env_ids] = True
+        roles = torch.arange(self._num_transition_envs, device=self.device)
+        self.transition_type[self._transition_env_ids] = roles % 6
+        self._transition_variants = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._transition_variants[self._transition_env_ids] = (roles // 6) % 2 == 1
+        self._transition_phase_offset = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._transition_phase_offset[self._transition_env_ids] = torch.randint(
+            4, (self._num_transition_envs,), device=self.device
+        )
+        self._all_env_ids = torch.arange(self.num_envs, device=self.device)
+        # 0:X, 1:Y, 2:같은 부호 대각선, 3:반대 부호 대각선, 4:X+yaw, 5:Y+yaw 순서임.
+        # 부호만 저장하고 실제 속도는 재샘플링 시 현재 명령 범위의 끝값에서 읽음.
+        self._transition_patterns = torch.tensor(
+            [
+                [[1, 0, 0], [-1, 0, 0], [1, 0, 0], [-1, 0, 0]],
+                [[0, 1, 0], [0, -1, 0], [0, 1, 0], [0, -1, 0]],
+                [[1, 1, 0], [-1, -1, 0], [1, 1, 0], [-1, -1, 0]],
+                [[1, -1, 0], [-1, 1, 0], [1, -1, 0], [-1, 1, 0]],
+                [[1, 0, 1], [-1, 0, -1], [1, 0, 1], [-1, 0, -1]],
+                [[0, 1, 1], [0, -1, -1], [0, 1, 1], [0, -1, -1]],
+            ],
+            dtype=torch.int8,
+            device=self.device,
+        )
+        self._transition_age = torch.full((self.num_envs,), math.inf, device=self.device)
+        self._transition_pending_recovery = torch.zeros_like(self.is_transition_env)
+        self._transition_count = torch.zeros(self.num_envs, device=self.device)
+        self._transition_window_steps = torch.zeros_like(self._transition_count)
+        self._transition_error_xy_sum = torch.zeros_like(self._transition_count)
+        self._transition_error_yaw_sum = torch.zeros_like(self._transition_count)
+        self._transition_peak_tilt = torch.zeros_like(self._transition_count)
+        self._transition_airborne_steps = torch.zeros_like(self._transition_count)
+        self._transition_recovery_sum = torch.zeros_like(self._transition_count)
+        self._transition_recovered_count = torch.zeros_like(self._transition_count)
+        self._transition_contact_sensor = None
+        if self.cfg.transition_contact_sensor_cfg is not None:
+            self.cfg.transition_contact_sensor_cfg.resolve(self._env.scene)
+            self._transition_contact_sensor = self._env.scene.sensors[self.cfg.transition_contact_sensor_cfg.name]
+            body_ids = self.cfg.transition_contact_sensor_cfg.body_ids
+            num_feet = (
+                len(range(self._transition_contact_sensor.num_sensors)[body_ids])
+                if isinstance(body_ids, slice)
+                else len(body_ids)
+            )
+            if num_feet != 4:
+                raise ValueError("transition_contact_sensor_cfg must select exactly four feet.")
+
+    def _selected_transition_ids(self, env_ids: Sequence[int] | slice) -> torch.Tensor:
+        """선택한 환경 중 전환 전용 환경의 인덱스만 반환함."""
+        selected = self._all_env_ids[env_ids]
+        return selected[self.is_transition_env[selected]]
+
+    def _resample_transition_commands(self, env_ids: Sequence[int] | slice) -> None:
+        """고정된 역할의 다음 명령을 즉시 적용하고 전환 전용 타이머를 갱신함."""
+        selected = self._selected_transition_ids(env_ids)
+        if len(selected) == 0:
+            return
+        roles = self.transition_type[selected]
+        phase = (self.command_counter[selected] + self._transition_phase_offset[selected]) % 4
+        signs = self._transition_patterns[roles, phase]
+        variants = self._transition_variants[selected]
+        signs[:, 2] *= torch.where(variants & ((roles == 4) | (roles == 5)), -1, 1)
+        for axis, bounds in enumerate(
+            (self.cfg.ranges.lin_vel_x, self.cfg.ranges.lin_vel_y, self.cfg.ranges.ang_vel_z)
+        ):
+            self.vel_command_b[selected, axis] = torch.where(
+                signs[:, axis] > 0, bounds[1], torch.where(signs[:, axis] < 0, bounds[0], 0.0)
+            )
+        self.is_standing_env[selected] = False
+        self.is_rotating_env[selected] = False
+        self.is_heading_env[selected] = False
+        self.time_left[selected] = self.time_left[selected].uniform_(*self.cfg.transition_resampling_time_range)
+        # 최초 명령은 전환 횟수에 포함하지 않으며, 리셋 시 command_counter가 0으로 돌아감.
+        changed = self.command_counter[selected] > 0
+        self._transition_count[selected] += changed.float()
+        self._transition_age[selected] = torch.where(changed, 0.0, math.inf)
+        self._transition_pending_recovery[selected] = changed
+
+    def _update_transition_metrics(self, error_xy: torch.Tensor, error_yaw: torch.Tensor) -> None:
+        """전환 후 0.5초의 자세·추종·접촉 상태와 목표 속도 최초 도달 시간을 기록함.
+
+        명령 매니저가 관측하는 비종료 스텝을 집계하며, 종료 직전 물리 스텝의 상태는 포함하지 않음.
+        전환 직후의 종료 여부는 리셋 시 transition_failure_rate로 별도 기록함.
+        """
+        selected = self._transition_env_ids
+        age = self._transition_age[selected]
+        in_window = age < 0.5
+        weight = in_window.float()
+        self._transition_window_steps[selected] += weight
+        self._transition_error_xy_sum[selected] += error_xy[selected] * weight
+        self._transition_error_yaw_sum[selected] += error_yaw[selected] * weight
+        gravity_z = self.robot.data.projected_gravity_b.torch[selected, 2]
+        tilt_deg = torch.acos((-gravity_z).clamp(-1.0, 1.0)) * (180.0 / math.pi)
+        self._transition_peak_tilt[selected] = torch.maximum(
+            self._transition_peak_tilt[selected], torch.where(in_window, tilt_deg, 0.0)
+        )
+        if self._transition_contact_sensor is not None:
+            contact = (
+                self._transition_contact_sensor.data.net_normal_forces_w.torch[
+                    :, self.cfg.transition_contact_sensor_cfg.body_ids, 2
+                ][selected]
+                > 1.0
+            )
+            self._transition_airborne_steps[selected] += (~contact.any(dim=1)).float() * weight
+        reached = (
+            self._transition_pending_recovery[selected]
+            & (error_xy[selected] < self.cfg.vel_xy_success_threshold)
+            & (error_yaw[selected] < self.cfg.vel_yaw_success_threshold)
+        )
+        self._transition_recovered_count[selected] += reached.float()
+        self._transition_recovery_sum[selected] += torch.where(reached, age + self._env.step_dt, 0.0)
+        self._transition_pending_recovery[selected] &= ~reached
+        self._transition_age[selected] += self._env.step_dt
+
+    def _reset_transition_metrics(self, env_ids: Sequence[int] | slice) -> dict[str, torch.Tensor]:
+        """리셋하는 전환 환경만 집계하여 일반 환경의 0 값으로 지표가 희석되지 않도록 함."""
+        selected = self._selected_transition_ids(env_ids)
+        if len(selected) == 0:
+            return {}
+        count = self._transition_count[selected].sum()
+        window_steps = self._transition_window_steps[selected].sum().clamp_min(1.0)
+        recovered = self._transition_recovered_count[selected].sum()
+        metrics = {
+            "transition_count": count,
+            "transition_error_vel_xy": self._transition_error_xy_sum[selected].sum() / window_steps,
+            "transition_error_vel_yaw": self._transition_error_yaw_sum[selected].sum() / window_steps,
+            "transition_peak_tilt_deg": self._transition_peak_tilt[selected].max(),
+            "transition_recovery_time_s": self._transition_recovery_sum[selected].sum() / recovered.clamp_min(1.0),
+            "transition_recovery_rate": recovered / count.clamp_min(1.0),
+        }
+        if self._transition_contact_sensor is not None:
+            metrics["transition_all_feet_airborne_ratio"] = (
+                self._transition_airborne_steps[selected].sum() / window_steps
+            )
+        if hasattr(self._env, "reset_terminated"):
+            recent = self._transition_age[selected] < 0.5
+            failures = self._env.reset_terminated[selected] & recent
+            metrics["transition_failure_rate"] = failures.float().sum() / count.clamp_min(1.0)
+        for buffer in (
+            self._transition_count,
+            self._transition_window_steps,
+            self._transition_error_xy_sum,
+            self._transition_error_yaw_sum,
+            self._transition_peak_tilt,
+            self._transition_airborne_steps,
+            self._transition_recovery_sum,
+            self._transition_recovered_count,
+        ):
+            buffer[selected] = 0.0
+        self._transition_age[selected] = math.inf
+        self._transition_pending_recovery[selected] = False
+        return metrics
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # set visibility of markers
@@ -306,6 +498,8 @@ class NormalVelocityCommand(UniformVelocityCommand):
             cfg: The command generator configuration.
             env: The environment.
         """
+        if cfg.rel_transition_envs != 0.0:
+            raise ValueError("Fixed transition environments are supported only by UniformVelocityCommand.")
         super().__init__(cfg, env)
         # create buffers for zero commands envs
         self.is_zero_vel_x_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)

@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import logging
 import os
+from datetime import datetime
 
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
@@ -18,6 +19,7 @@ from tensordict import TensorDict
 
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
+from isaaclab.envs.mdp.commands import UniformVelocityCommandCfg
 from isaaclab.utils import to_dict
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.seed import configure_seed
@@ -26,6 +28,7 @@ from isaaclab.utils.string import list_intersection
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, resolve_task_config, setup_preset_cli
 
+from ...diagnostics.locomotion_metrics import RslRlLocomotionMetrics
 from ...rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from ...utils.wandb import is_wandb_checkpoint, resolve_wandb_checkpoint
 from ..common import (
@@ -35,6 +38,7 @@ from ..common import (
     apply_video_recording,
     close_env,
     create_isaaclab_env,
+    dump_train_configs,
     enable_cameras_for_video,
     normalize_task_name,
     pre_launch_video_config,
@@ -65,12 +69,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--external_callback", default=None, help="Fully qualified path to an externally defined callback."
     )
+    parser.add_argument(
+        "--log_metrics", action="store_true", help="Log Gait/Velocity to a separate checkpoint evaluation run."
+    )
+    parser.add_argument(
+        "--metrics_steps", type=int, default=None, help="Stop metric playback after this many control steps."
+    )
     controls = parser.add_mutually_exclusive_group()
     controls.add_argument(
         "--gamepad", action="store_true", help="Control base_velocity with a gamepad; Y toggles tracking."
     )
     controls.add_argument(
         "--keyboard", action="store_true", help="Control base_velocity with the keyboard; Y toggles tracking."
+    )
+    parser.add_argument(
+        "--keyboard_repeat_grace",
+        type=float,
+        default=0.0,
+        help="Bridge remote keyboard pulses for this many seconds; also delays stopping by up to this duration.",
     )
     parser.add_argument(
         "--fixed_camera",
@@ -139,6 +155,8 @@ def run(argv: list[str]) -> None:
                     command_cfg.heading_command = False
                     command_cfg.rel_standing_envs = 0.0
                     command_cfg.rel_rotating_envs = 0.0
+                    if isinstance(command_cfg, UniformVelocityCommandCfg):
+                        command_cfg.rel_transition_envs = 0.0
                     command_cfg.ranges.heading = None
                     command_cfg.ranges.lin_vel_x = (0.0, 0.0)
                     command_cfg.ranges.lin_vel_y = (0.0, 0.0)
@@ -161,8 +179,19 @@ def run(argv: list[str]) -> None:
             if resume_path is None:
                 return
             log_dir = os.path.dirname(resume_path)
-            env_cfg.log_dir = log_dir
-            apply_video_recording(env_cfg, log_dir, args_cli, subdir="play", checkpoint_path=resume_path)
+            metrics_log_dir = None
+            if args_cli.log_metrics:
+                metrics_cfg = getattr(env_cfg, "locomotion_metrics", None)
+                if metrics_cfg is None or not metrics_cfg.enabled:
+                    raise ValueError("--log_metrics requires enabled env.locomotion_metrics.")
+                stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+                model_name = os.path.splitext(os.path.basename(resume_path))[0]
+                metrics_log_dir = os.path.join(log_dir, "evaluations", f"{stamp}_{model_name}")
+                logger.info(f"Playback metrics directory: {metrics_log_dir}")
+            if args_cli.metrics_steps is not None and (not args_cli.log_metrics or args_cli.metrics_steps < 1):
+                raise ValueError("--metrics_steps requires --log_metrics and a positive step count.")
+            env_cfg.log_dir = metrics_log_dir or log_dir
+            apply_video_recording(env_cfg, env_cfg.log_dir, args_cli, subdir="play", checkpoint_path=resume_path)
 
             screen.stage("Creating environment")
             env = create_isaaclab_env(
@@ -177,15 +206,28 @@ def run(argv: list[str]) -> None:
             env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
             logger.info(f"Loading model checkpoint from: {resume_path}")
             if agent_cfg.class_name == "OnPolicyRunner":
-                runner = OnPolicyRunner(env, to_dict(agent_cfg), log_dir=None, device=agent_cfg.device)
+                runner = OnPolicyRunner(env, to_dict(agent_cfg), log_dir=metrics_log_dir, device=agent_cfg.device)
             elif agent_cfg.class_name == "DistillationRunner":
-                runner = DistillationRunner(env, to_dict(agent_cfg), log_dir=None, device=agent_cfg.device)
+                runner = DistillationRunner(env, to_dict(agent_cfg), log_dir=metrics_log_dir, device=agent_cfg.device)
             else:
                 raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
             # configure_seed must run after runner construction so torch determinism does not disturb its initialization
             if args_cli.deterministic:
                 configure_seed(env_cfg.seed, torch_deterministic=True)
             runner.load(resume_path)
+            if args_cli.log_metrics:
+                dump_train_configs(metrics_log_dir, env_cfg, agent_cfg)
+                runner.logger.init_logging_writer()
+
+                def close_metrics_writer():
+                    runner.logger.stop_logging_writer()
+                    if runner.logger.writer is not None:
+                        runner.logger.writer.close()
+
+                cleanup.callback(close_metrics_writer)
+                cleanup.enter_context(RslRlLocomotionMetrics(runner, playback=True))
+                with open(os.path.join(metrics_log_dir, "checkpoint.txt"), "w") as stream:
+                    stream.write(os.path.abspath(resume_path) + "\n")
             policy = runner.get_inference_policy(device=env.unwrapped.device)
 
             export_model_dir = os.path.join(log_dir, "exported")
@@ -214,9 +256,9 @@ def run(argv: list[str]) -> None:
                     from ._playback_gamepad import gamepad_with_camera_cfg
 
                     input_cfg = gamepad_with_camera_cfg(
-                        v_x_sensitivity=2.0,
+                        v_x_sensitivity=1.0,
                         v_y_sensitivity=1.0,
-                        omega_z_sensitivity=3.0,
+                        omega_z_sensitivity=1.0,
                         dead_zone=0.15,
                         sim_device=str(base_env.device),
                     )
@@ -224,10 +266,11 @@ def run(argv: list[str]) -> None:
                     from ._playback_keyboard import wasd_keyboard_cfg
 
                     input_cfg = wasd_keyboard_cfg(
-                        v_x_sensitivity=2.0,
-                        v_y_sensitivity=1.0,
-                        omega_z_sensitivity=3.0,
+                        v_x_sensitivity=1.5,
+                        v_y_sensitivity=0.5,
+                        omega_z_sensitivity=1.5,
                         sim_device=str(base_env.device),
+                        repeat_grace_s=args_cli.keyboard_repeat_grace,
                     )
                     logger.info(
                         "Keyboard: w/a/s/d move, left/right arrows turn; "
@@ -295,4 +338,6 @@ def run(argv: list[str]) -> None:
                     camera.update()
 
             screen.close()
-            run_playback(step, dt=env.unwrapped.step_dt, args_cli=args_cli, env_cfg=env_cfg)
+            run_playback(
+                step, dt=env.unwrapped.step_dt, args_cli=args_cli, env_cfg=env_cfg, max_steps=args_cli.metrics_steps
+            )

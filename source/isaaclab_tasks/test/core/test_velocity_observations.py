@@ -50,7 +50,7 @@ def test_velocity_observations_separate_noisy_actor_and_privileged_state(height_
         device="cpu",
         sim=SimpleNamespace(is_playing=lambda: True),
         command_manager=SimpleNamespace(get_command=lambda name: commands),
-        action_manager=SimpleNamespace(action=actions),
+        action_manager=SimpleNamespace(action=actions, prev_action=actions + 20, prev_prev_action=actions + 40),
     )
     manager = ObservationManager(cfg, env)
     with torch.random.fork_rng(devices=[]):
@@ -66,13 +66,13 @@ def test_velocity_observations_separate_noisy_actor_and_privileged_state(height_
             torch.manual_seed(10)
             changed_terrain = manager.compute()
 
-    assert original["actor_obs"].shape == original["critic_base_obs"].shape == (2, 45)
+    assert original["actor_obs"].shape == original["critic_base_obs"].shape == (2, 69)
     assert original["privileged_obs"].shape == (2, 190 if height_scan else 3)
     assert not torch.equal(original["actor_obs"], noisy["actor_obs"])
     torch.testing.assert_close(original["critic_base_obs"], noisy["critic_base_obs"], rtol=0, atol=0)
     torch.testing.assert_close(original["privileged_obs"], noisy["privileged_obs"], rtol=0, atol=0)
     torch.testing.assert_close(original["actor_obs"][:, 6:9], commands, rtol=0, atol=0)
-    torch.testing.assert_close(original["actor_obs"][:, -12:], actions, rtol=0, atol=0)
+    torch.testing.assert_close(original["actor_obs"][:, 33:45], actions, rtol=0, atol=0)
     torch.testing.assert_close(original["critic_base_obs"][:, :3], data.root_ang_vel_b.torch, rtol=0, atol=0)
     torch.testing.assert_close(changed_velocity["actor_obs"], original["actor_obs"], rtol=0, atol=0)
     torch.testing.assert_close(changed_velocity["critic_base_obs"], original["critic_base_obs"], rtol=0, atol=0)
@@ -82,3 +82,7 @@ def test_velocity_observations_separate_noisy_actor_and_privileged_state(height_
         torch.testing.assert_close(changed_terrain["actor_obs"], original["actor_obs"], rtol=0, atol=0)
         torch.testing.assert_close(changed_terrain["critic_base_obs"], original["critic_base_obs"], rtol=0, atol=0)
         torch.testing.assert_close(changed_terrain["privileged_obs"][:, 3:], torch.full((2, 187), 0.1))
+
+    for group_name in ("actor_obs", "critic_base_obs"):
+        torch.testing.assert_close(original[group_name][:, 45:57], actions + 20, rtol=0, atol=0)
+        torch.testing.assert_close(original[group_name][:, 57:69], actions + 40, rtol=0, atol=0)

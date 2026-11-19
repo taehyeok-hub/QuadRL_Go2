@@ -7,7 +7,7 @@ import math
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import CommandTermCfg
+from isaaclab.managers import CommandTermCfg, SceneEntityCfg
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, FRAME_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
 from isaaclab.utils import configclass, replace
@@ -55,6 +55,23 @@ class UniformVelocityCommandCfg(CommandTermCfg):
 
     rel_rotating_envs: float = 0.0
     # 각 환경이 회전 상태로 선택될 확률.
+
+    rel_transition_envs: float = 0.0
+    """방향 전환을 연습할 고정 환경의 비율임.
+
+    전체 환경 중 ``round(num_envs * rel_transition_envs)``개를 무작위로 선택함.
+    여섯 전환 유형에 가능한 한 균등하게 배정하며, 환경과 유형의 배정은 학습 도중과 부분 리셋 후에도 유지함.
+    기본값 0에서는 전환 전용 환경을 배정하지 않음.
+    """
+
+    transition_resampling_time_range: tuple[float, float] = (2.0, 2.0)
+    """전환 전용 환경에서 일반 재샘플링 시간 대신 사용할 명령 유지 시간 범위이며 단위는 초임."""
+
+    transition_contact_sensor_cfg: SceneEntityCfg | None = None
+    """전환 직후 네 발의 공중 상태를 기록할 기존 접촉 센서 설정임.
+
+    네 발의 선택 순서는 센서 설정에서 지정하며, None이면 접촉 기반 전환 지표를 수집하지 않음.
+    """
 
     rel_heading_envs: float = 1.0
     # 각 환경이 목표 방향의 오차로 계산한 각속도 명령을 따르도록 선택될 확률. 

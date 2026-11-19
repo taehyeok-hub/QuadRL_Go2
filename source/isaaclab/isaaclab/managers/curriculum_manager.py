@@ -102,20 +102,22 @@ class CurriculumManager(ManagerBase):
             Dictionary of curriculum terms and their states.
         """
         extras = {}
+        terms = dict(zip(self._term_names, self._term_cfgs))
         for term_name, term_state in self._curriculum_state.items():
             if term_state is not None:
+                prefix = getattr(terms[term_name].func, "metric_namespace", f"Curriculum/{term_name}")
                 # deal with dict
                 if isinstance(term_state, dict):
                     # each key is a separate state to log
                     for key, value in term_state.items():
                         if isinstance(value, torch.Tensor):
                             value = value.detach().clone()
-                        extras[f"Curriculum/{term_name}/{key}"] = value
+                        extras[f"{prefix}/{key}"] = value
                 else:
                     # log directly if not a dict
                     if isinstance(term_state, torch.Tensor):
                         term_state = term_state.detach().clone()
-                    extras[f"Curriculum/{term_name}"] = term_state
+                    extras[prefix] = term_state
         # reset all the curriculum terms
         for term_cfg in self._class_term_cfgs:
             term_cfg.func.reset(env_ids=env_ids)
@@ -137,6 +139,29 @@ class CurriculumManager(ManagerBase):
         for name, term_cfg in zip(self._term_names, self._term_cfgs):
             state = term_cfg.func(self._env, env_ids, **term_cfg.params)
             self._curriculum_state[name] = state
+
+    def update(self, dt: float):
+        """Collect post-physics data before resets for stateful curriculum terms."""
+        for term_cfg in self._class_term_cfgs:
+            update = getattr(term_cfg.func, "update", None)
+            if update is not None:
+                update(dt)
+
+    def state_dict(self) -> dict:
+        """Return checkpoint state for curriculum terms that support persistence."""
+        return {
+            name: cfg.func.state_dict()
+            for name, cfg in zip(self._term_names, self._term_cfgs)
+            if hasattr(cfg.func, "state_dict")
+        }
+
+    def load_state_dict(self, state: dict):
+        """Restore compatible stateful terms without changing the current scene."""
+        terms = {name: cfg.func for name, cfg in zip(self._term_names, self._term_cfgs)}
+        if set(state) != set(self.state_dict()):
+            raise ValueError("Checkpoint curriculum terms do not match the configured curriculum.")
+        for name, value in state.items():
+            terms[name].load_state_dict(value)
 
     def get_active_iterable_terms(self, env_idx: int) -> Sequence[tuple[str, Sequence[float]]]:
         """Returns the active terms as iterable sequence of tuples.
@@ -161,7 +186,7 @@ class CurriculumManager(ManagerBase):
                     # each key is a separate state to log
                     for key, value in term_state.items():
                         if isinstance(value, torch.Tensor):
-                            value = value.item()
+                            value = value.float().mean().item()
                         data.append(value)
                 else:
                     # log directly if not a dict

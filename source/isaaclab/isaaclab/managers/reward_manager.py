@@ -189,6 +189,10 @@ class RewardManager(ManagerBase):
         # return the configuration
         return self._term_cfgs[self._term_names.index(term_name)]
 
+    def get_episode_sums(self, env_ids: Sequence[int] | torch.Tensor | slice = slice(None)) -> dict[str, torch.Tensor]:
+        """Return independent weighted, time-integrated sums before episode reset."""
+        return {name: values[env_ids].detach().clone() for name, values in self._episode_sums.items()}
+
     def get_active_iterable_terms(self, env_idx: int) -> Sequence[tuple[str, Sequence[float]]]:
         """Returns the active terms as iterable sequence of tuples.
 

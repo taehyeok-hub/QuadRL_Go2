@@ -14,6 +14,8 @@ import trimesh
 from isaaclab.terrains import (
     FlatPatchSamplingCfg,
     MeshFileTerrainCfg,
+    MeshInvertedPyramidStairsTerrainCfg,
+    MeshPyramidStairsTerrainCfg,
     MeshRepeatedBoxesTerrainCfg,
     MeshStarTerrainCfg,
     TerrainGenerator,
@@ -34,6 +36,39 @@ from isaaclab.terrains.trimesh.utils import make_box, make_cone, make_cylinder
 from isaaclab.utils.seed import configure_seed
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize(
+    "cfg_type,widths",
+    [
+        (MeshPyramidStairsTerrainCfg, (0.26, 0.30)),
+        (MeshInvertedPyramidStairsTerrainCfg, (0.30, 0.26)),
+    ],
+)
+def test_stair_step_width_range(cfg_type, widths):
+    """Generated treads follow the width range and retain fixed-width compatibility."""
+    cfg = cfg_type(size=(8.0, 8.0), step_height_range=(0.05, 0.2), step_width=0.3, platform_width=2.0)
+    meshes, _ = cfg.function(0.5, cfg)
+    assert min(mesh.extents[:2].min() for mesh in meshes) == pytest.approx(0.3)
+
+    cfg.step_width_range = widths
+    cfg.validate()
+    for difficulty, expected in ((0.0, widths[0]), (0.5, 0.28), (1.0, widths[1])):
+        meshes, _ = cfg.function(difficulty, cfg)
+        assert min(mesh.extents[:2].min() for mesh in meshes) == pytest.approx(expected)
+    cfg.step_width = None
+    cfg.validate()
+    meshes, _ = cfg.function(0.5, cfg)
+    assert min(mesh.extents[:2].min() for mesh in meshes) == pytest.approx(0.28)
+    assert cfg.step_width is None
+
+
+@pytest.mark.parametrize("width_range", [(0.0, 0.3), (0.26, -0.3), (float("nan"), 0.3)])
+def test_invalid_stair_step_width_range(width_range):
+    """Invalid range endpoints fail before mesh construction."""
+    cfg = MeshPyramidStairsTerrainCfg(size=(8.0, 8.0), step_height_range=(0.05, 0.2), step_width_range=width_range)
+    with pytest.raises(ValueError, match="step_width_range"):
+        cfg.function(0.5, cfg)
 
 
 @pytest.fixture
@@ -291,6 +326,8 @@ def test_generation_reproducibility(use_global_seed):
     cfg.use_cache = False
     cfg.seed = seed if use_global_seed else None
     terrain_generator = TerrainGenerator(cfg=cfg)
+    assert terrain_generator.generation_seed == seed
+    assert cfg.seed == (seed if use_global_seed else None)
 
     # keep a copy of the generated terrain mesh
     terrain_mesh_1 = terrain_generator.terrain_mesh.copy()
@@ -300,6 +337,7 @@ def test_generation_reproducibility(use_global_seed):
 
     # create terrain generator
     terrain_generator = TerrainGenerator(cfg=cfg)
+    assert terrain_generator.generation_seed == seed
 
     # keep a copy of the generated terrain mesh
     terrain_mesh_2 = terrain_generator.terrain_mesh.copy()

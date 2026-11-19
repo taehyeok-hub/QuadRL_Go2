@@ -132,13 +132,18 @@ class MySceneCfg(InteractiveSceneCfg):
 
 @configclass
 class CommandsCfg:
-    """Command specifications for the MDP."""
+    """ 현재 MDP에서 Command 및 reset 설정 """
 
     base_velocity = mdp.UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.05,     
-        rel_rotating_envs=0.05,
+        rel_standing_envs=0.02,     
+        rel_rotating_envs=0.02,
+        rel_transition_envs=0.075,
+        transition_resampling_time_range=(2.0, 2.0),
+        transition_contact_sensor_cfg = SceneEntityCfg(
+            "contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+        ),
         rel_heading_envs=1.0,
         heading_command=False,
         heading_control_stiffness=0.5,
@@ -178,6 +183,8 @@ class ObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
         actions = ObsTerm(func=mdp.last_action)
+        last_actions = ObsTerm(func=mdp.action_history, params={"index": 1})
+        last_last_actions = ObsTerm(func=mdp.action_history, params={"index": 2})
 
         def __post_init__(self):
             self.enable_corruption = True  # 해당 관측 그룹에 설정된 노이즈를 적용하는 스위치
@@ -227,8 +234,8 @@ class EventsCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.8, 0.8),
-            "dynamic_friction_range": (0.6, 0.6),
+            "static_friction_range": (0.3, 1.2),
+            "dynamic_friction_range": (0.3, 1.2),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -389,6 +396,7 @@ class RewardsCfg:
 
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+    dof_vel_limits = RewTerm(func=mdp.joint_vel_limits, weight=0.0, params={"soft_ratio": 0.9})
 
 
 

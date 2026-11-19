@@ -108,6 +108,10 @@ def test_compute():
         env.step = step
         torch.testing.assert_close(rew_man.compute(dt=dt), torch.tensor(expected))
 
+    snapshot = rew_man.get_episode_sums(torch.tensor([2]))
+    torch.testing.assert_close(snapshot["scaled"], torch.tensor([-3.0]))
+    torch.testing.assert_close(snapshot["scalar"], torch.tensor([2.0]))
+    snapshot["scaled"].zero_()
     reset_env_2 = rew_man.reset(torch.tensor([2]))
     assert {name: value.item() for name, value in reset_env_2.items()} == {
         "Episode_Reward/scaled": -1.5,

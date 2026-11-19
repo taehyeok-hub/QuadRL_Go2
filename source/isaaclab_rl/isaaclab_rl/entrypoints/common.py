@@ -1027,7 +1027,9 @@ Playback.
 """
 
 
-def run_playback(step: Callable[[], None], *, dt: float, args_cli: argparse.Namespace, env_cfg: Any) -> None:
+def run_playback(
+    step: Callable[[], None], *, dt: float, args_cli: argparse.Namespace, env_cfg: Any, max_steps: int | None = None
+) -> None:
     """Step a policy until interrupted, or until the requested video clip is complete.
 
     Args:
@@ -1036,8 +1038,11 @@ def run_playback(step: Callable[[], None], *, dt: float, args_cli: argparse.Name
         dt: Environment step duration [s], used to pace real-time playback.
         args_cli: Parsed command-line arguments providing ``video``, ``video_length`` and ``real_time``.
         env_cfg: Environment config whose first video recorder bounds the clip when ``--video_length`` is omitted.
+        max_steps: Optional additional control-step limit, also honored without video recording.
     """
-    max_steps = video_playback_steps(args_cli, env_cfg)
+    video_steps = video_playback_steps(args_cli, env_cfg)
+    if video_steps is not None:
+        max_steps = video_steps if max_steps is None else min(max_steps, video_steps)
     logger.info("Policy playback is running, press Ctrl+C to exit...")
     step_count = 0
     with contextlib.suppress(KeyboardInterrupt):
