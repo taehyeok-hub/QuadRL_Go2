@@ -53,7 +53,7 @@ from isaaclab.actuators import (
 )
 from isaaclab.actuators.actuator_net_cfg import ActuatorNetLSTMCfg, ActuatorNetMLPCfg
 from isaaclab.actuators.actuator_pd_cfg import RemotizedPDActuatorCfg
-from isaaclab.actuators.newton import read_group_parameter
+from isaaclab.actuators.newton import read_group_parameter, write_group_parameter
 from isaaclab.actuators.newton.kernels import sync_torque_telemetry
 from isaaclab.assets import ArticulationCfg
 from isaaclab.sim import SimulationContext, build_simulation_context
@@ -823,7 +823,7 @@ def test_newton_actuator_authoring(
 
 
 def test_newton_actuator_rollout_matches_reordered_joints(newton_run: _Run) -> None:
-    """Match Newton-backend actuator traces under a permuted public joint ordering.
+    """Match Newton-backend actuator traces and speed limits under a permuted public joint ordering.
 
     The implicit hip group reads its torque telemetry from backend-order effort buffers, so the
     permutation-sensitive feedforward effort also checks that gather.
@@ -835,6 +835,28 @@ def test_newton_actuator_rollout_matches_reordered_joints(newton_run: _Run) -> N
     assert installed_ordering is not None
     assert not installed_ordering["is_identity"]
     assert_articulation_ordering_trace_matches(identity_result, reordered_result, _LEG_REORDERED_JOINT_NAMES)
+
+    # Only the DC knees set an actuator speed limit; the other joints inherit the solver limits.
+    articulation = newton_run.articulations["mixed_permuted_reordered"]
+    expected_limits = articulation.data.joint_vel_limits.torch.clone()
+    knee_ids, _ = articulation.find_joints(".*KFE")
+    expected_limits[:, knee_ids] = 7.5
+    torch.testing.assert_close(articulation.data.soft_joint_vel_limits.torch, expected_limits)
+
+    write_group_parameter(
+        articulation.actuators,
+        "knees",
+        "clamping",
+        "velocity_limit",
+        values=torch.tensor([[5.0]], device=articulation.device),
+        env_ids=torch.tensor([1], device=articulation.device),
+        joint_ids=torch.tensor([0], device=articulation.device),
+    )
+    articulation.write_data_to_sim()
+    newton_run.sim.step()
+    articulation.update(DT)
+    expected_limits[1, knee_ids[0]] = 5.0
+    torch.testing.assert_close(articulation.data.soft_joint_vel_limits.torch, expected_limits)
 
 
 @pytest.mark.parametrize("island", ["ideal", "ideal_reordered"], ids=["identity", "reordered"])

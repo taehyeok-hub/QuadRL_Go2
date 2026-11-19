@@ -7,6 +7,7 @@
 
 from isaaclab.utils import configclass
 
+from ...velocity_env_cfg import ObservationsCfg
 from .rough_env_cfg import UnitreeGo2Rewards, UnitreeGo2RoughEnvCfg
 
 
@@ -23,6 +24,7 @@ class UnitreeGo2FlatRewards(UnitreeGo2Rewards):
 class UnitreeGo2FlatEnvCfg(UnitreeGo2RoughEnvCfg):
     """Configuration for the Unitree Go2 velocity-tracking environment on flat terrain."""
 
+    observations: ObservationsCfg = ObservationsCfg()
     rewards: UnitreeGo2FlatRewards = UnitreeGo2FlatRewards()
 
     def __post_init__(self):

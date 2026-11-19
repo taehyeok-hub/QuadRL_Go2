@@ -27,6 +27,7 @@ from .actuator_base_cfg import ActuatorBaseCfg, _is_implicit_actuator_cfg
 from .actuator_compat import resolve_limit_aliases
 from .actuator_control import _JOINT_PROPERTY_KEYS, ActuatorControl
 from .actuator_pd import IdealPDActuator, ImplicitActuator
+from .actuator_pd_cfg import DCMotorCfg, RemotizedPDActuatorCfg
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
         self._group_joint_indices: dict[str, slice | torch.Tensor] = {}
         self._implicit_group_names: set[str] = set()
         self._native_group_names: set[str] = set()
+        self._native_velocity_limit_views = []
         self._debug_value_resolution = debug_value_resolution
         self._joint_property_resolution_rows: dict[str, dict[str, tuple[tuple[object, ...], ...]]] = {}
         self._has_implicit_actuators = False
@@ -100,7 +102,9 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
                     f"{sorted(self._native_group_names)} but finalize_native_actuators returned no selection."
                 )
             for actuator_name in self._native_group_names:
-                self._groups[actuator_name] = self._resolve_newton_group_actuators(actuator_name)
+                self._groups[actuator_name] = self._resolve_newton_group_actuators(
+                    actuator_name, resolved_cfgs[actuator_name]
+                )
         self._validate_coverage()
         self._build_execution_plan()
         if self._debug_value_resolution:
@@ -200,6 +204,8 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
             dt: Physics step size [s].
         """
         if self._control.compute_native_actuators(self, dt):
+            for target, clamping, indices in self._native_velocity_limit_views:
+                wp.copy(target, clamping.velocity_limit[indices])
             return
 
         if self._implicit_executor is not None:
@@ -352,6 +358,21 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
                     # explicit models default their clip limit to the authored joint effort limit.
                     actuator_kwargs["actuator_effort_limit"] = joint_defaults["joint_effort_limit"]
                 self._groups[actuator_name] = instantiate(actuator_cfg, **actuator_kwargs)
+            if self._control.native_actuator_path_active:
+                # The native execution path skips the Lab kernels that normally publish these limits.
+                if isinstance(actuator_cfg, RemotizedPDActuatorCfg):
+                    velocity_limit = torch.inf
+                elif native_managed:
+                    velocity_limit = resolve_joint_parameter(
+                        actuator_cfg.actuator_velocity_limit,
+                        properties["joint_velocity_limit"],
+                        joint_names,
+                        self.num_instances,
+                        self.device,
+                    )
+                else:
+                    velocity_limit = self._groups[actuator_name].actuator_velocity_limit
+                wp.to_torch(self._soft_joint_vel_limits)[:, actuator_joint_ids] = velocity_limit
             if self._debug_value_resolution:
                 self._joint_property_resolution_rows[actuator_name] = table_rows
             construction_records.append(
@@ -374,8 +395,8 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
             if isinstance(actuator, ImplicitActuator):
                 actuator._bind_actuator_parameters(self._control)
 
-    def _resolve_newton_group_actuators(self, name: str) -> object:
-        """Return the Newton actuator object(s) that drive one group's joints.
+    def _resolve_newton_group_actuators(self, name: str, cfg: ActuatorBaseCfg) -> object:
+        """Bind live DC motor speed telemetry and return the Newton actuators driving the group.
 
         Newton merges structurally identical joints into one actuator, so the
         returned object can be shared between groups. A single covering actuator
@@ -386,9 +407,22 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
         matched = []
         for actuator in self._newton_selection.actuators:
             mapping = wp.to_torch(view._get_actuator_dof_mapping(actuator))
-            env_columns = mapping.reshape(self.num_instances, -1)[0]
-            if bool((env_columns[columns] >= 0).any()):
-                matched.append(actuator)
+            mapping = mapping.reshape(self.num_instances, -1)
+            if not bool((mapping[0, columns] >= 0).any()):
+                continue
+            matched.append(actuator)
+            if isinstance(cfg, DCMotorCfg) and cfg.actuator_velocity_limit is not None:
+                # Cache the projection into public joint order. Newton owns the mutable motor ratings.
+                group_mapping = mapping[:, columns]
+                env_ids, local_ids = torch.where(group_mapping >= 0)
+                joint_ids = self._group_joint_indices[name]
+                public_ids = local_ids if isinstance(joint_ids, slice) else joint_ids[local_ids]
+                target_ids = wp.from_torch((env_ids * self.num_joints + public_ids).int())
+                target = self._soft_joint_vel_limits.flatten()[target_ids]
+                indices = wp.from_torch(group_mapping[env_ids, local_ids].contiguous())
+                for clamping in actuator.clamping:
+                    if hasattr(clamping, "velocity_limit"):
+                        self._native_velocity_limit_views.append((target, clamping, indices))
         if not matched:
             raise RuntimeError(f"No Newton actuator drives any joint of group '{name}'.")
         return matched[0] if len(matched) == 1 else tuple(matched)

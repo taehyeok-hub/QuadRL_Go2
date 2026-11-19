@@ -19,7 +19,7 @@ from ... import mdp
 from ...mdp.curriculum.success import SuccessTerrainCfg, SuccessTerrainCurriculum
 from ...mdp.curriculum.terminations import assigned_terrain_boundary
 from ...mdp.metrics import LocomotionMetricsCfg
-from ...velocity_env_cfg import LocomotionVelocityRoughEnvCfg, RewardsCfg, TerminationsCfg
+from ...velocity_env_cfg import LocomotionVelocityRoughEnvCfg, ObservationsCfg, RewardsCfg, TerminationsCfg
 
 # UNITREE_GO2_CFG.init_state.pos is (0, 0, 0.28)
 _GO2_STANDING_HEIGHT = 0.28
@@ -248,6 +248,11 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     실제 학습에 사용할 환경 구성을 완성하는 것이 목적이다.
     """
 
+    observations: ObservationsCfg = ObservationsCfg(
+        actor_obs=ObservationsCfg.ActorObsCfg(last_actions=None, last_last_actions=None),
+        critic_base_obs=ObservationsCfg.CriticBaseObsCfg(last_actions=None, last_last_actions=None),
+    )
+
     # --- rewards ---
     rewards: UnitreeGo2Rewards = UnitreeGo2Rewards()
 
@@ -307,8 +312,9 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.termination.weight = -1.0
         self.rewards.collisions.weight = -1.0  # -1.0 에서 변경
         # --> collision = 0.0 변경 시, iteration time이 커지는 경향 발생.
+        
         self.rewards.dof_pos_limits.weight = -10.0
-        self.rewards.dof_vel_limits.weight = -10.0
+        self.rewards.dof_vel_limits.weight = 0.0
         self.rewards.dof_acc_l2.weight = -4.5e-7  # -4.5e-7 에서 변경
         self.rewards.dof_torques_l2.weight = -0.0001
 
