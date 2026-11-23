@@ -93,13 +93,24 @@ Joint terminations.
 """
 
 
-def joint_pos_out_of_limit(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Terminate when the asset's joint positions are outside of the soft joint limits."""
+def joint_pos_out_of_limit(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    use_soft_limits: bool = True,
+) -> torch.Tensor:
+    """Terminate when a joint position is outside the selected limits.
+
+    Args:
+        env: The learning environment.
+        asset_cfg: The articulation and joints to check.
+        use_soft_limits: Use soft limits when true. When false, use the joint position limits provided to simulation.
+    """
     asset: Articulation = env.scene[asset_cfg.name]
     if asset_cfg.joint_ids is None:
         asset_cfg.joint_ids = slice(None)
 
-    limits = asset.data.soft_joint_pos_limits.torch[:, asset_cfg.joint_ids]
+    pos_limits = asset.data.soft_joint_pos_limits if use_soft_limits else asset.data.joint_pos_limits
+    limits = pos_limits.torch[:, asset_cfg.joint_ids]
     out_of_upper_limits = torch.any(asset.data.joint_pos.torch[:, asset_cfg.joint_ids] > limits[..., 1], dim=1)
     out_of_lower_limits = torch.any(asset.data.joint_pos.torch[:, asset_cfg.joint_ids] < limits[..., 0], dim=1)
     return torch.logical_or(out_of_upper_limits, out_of_lower_limits)

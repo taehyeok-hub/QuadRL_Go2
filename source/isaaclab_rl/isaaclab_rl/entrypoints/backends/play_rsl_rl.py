@@ -266,9 +266,9 @@ def run(argv: list[str]) -> None:
                     from ._playback_keyboard import wasd_keyboard_cfg
 
                     input_cfg = wasd_keyboard_cfg(
-                        v_x_sensitivity=1.5,
-                        v_y_sensitivity=0.5,
-                        omega_z_sensitivity=1.5,
+                        v_x_sensitivity=1.0,
+                        v_y_sensitivity=1.0,
+                        omega_z_sensitivity=1.0,
                         sim_device=str(base_env.device),
                         repeat_grace_s=args_cli.keyboard_repeat_grace,
                     )

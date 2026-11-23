@@ -238,21 +238,45 @@ def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneE
     return torch.sum(torch.square(joint_pos - target), dim=1)
 
 
-def joint_pos_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize joint positions if they cross the soft limits.
+def joint_pos_limits(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    speed_scale: float = 0.01,
+    brake_margin: float = 0.05,
+) -> torch.Tensor:
+    """ 관절 위치가 소프트 한계를 벗어난 거리를 합산합니다.
 
-    This is computed as a sum of the absolute value of the difference between the joint position and the soft limits.
+    속도 비용을 켜면 한계 근처에서 바깥 방향으로 움직이는 관절에 추가 비용을 부과합니다.
+    속도 비용의 적용 비율은 한계 안쪽의 지정 거리에서 0으로 시작해 한계에서 1까지 선형으로 증가합니다.
+
+    Args:
+        env: 학습 환경.
+        asset_cfg: 비용을 적용할 로봇과 관절 설정.
+        speed_scale: 위치 비용에 더할 속도 비용의 가중치.
+        brake_margin: 속도 비용이 적용되기 시작하는 한계 안쪽 거리(라디안). 양수여야 합니다.
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    out_of_limits = -(
-        asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
-        - asset.data.soft_joint_pos_limits.torch[:, asset_cfg.joint_ids, 0]
-    ).clip(max=0.0)
-    out_of_limits += (
-        asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
-        - asset.data.soft_joint_pos_limits.torch[:, asset_cfg.joint_ids, 1]
-    ).clip(min=0.0)
+    joint_ids = asset_cfg.joint_ids
+    joint_pos = asset.data.joint_pos.torch[:, joint_ids]
+    soft_limits = asset.data.soft_joint_pos_limits.torch[:, joint_ids]
+
+    # 기존 방식: 관절 위치가 소프트 한계를 벗어난 거리만 합산합니다.
+    distance_to_lower = joint_pos - soft_limits[..., 0]
+    distance_to_upper = soft_limits[..., 1] - joint_pos
+    out_of_limits = -distance_to_lower.clip(max=0.0)
+    out_of_limits += (-distance_to_upper).clip(min=0.0)
     return torch.sum(out_of_limits, dim=1)
+
+    # 속도 비용을 켜려면 위 return을 주석 처리하고 아래 계산과 마지막 return의 주석을 해제하세요.
+    # 한계 근처에서 한계 바깥쪽으로 움직이는 관절에 속도 비용을 추가합니다.
+    # joint_vel = asset.data.joint_vel.torch[:, joint_ids]
+    # lower_gate = (1.0 - distance_to_lower / brake_margin).clamp(0.0, 1.0)
+    # upper_gate = (1.0 - distance_to_upper / brake_margin).clamp(0.0, 1.0)
+    # toward_lower = (-joint_vel).clamp_min(0.0)
+    # toward_upper = joint_vel.clamp_min(0.0)
+    # speed_cost = lower_gate * toward_lower + upper_gate * toward_upper
+
+    # return torch.sum(out_of_limits, dim=1) + speed_scale * speed_cost.sum(dim=1)
 
 
 def joint_vel_limits(
@@ -278,6 +302,26 @@ def joint_vel_limits(
     # clip to max error = 1 rad/s per joint to avoid huge penalties
     out_of_limits = out_of_limits.clip_(min=0.0, max=1.0)
     return torch.sum(out_of_limits, dim=1)
+
+
+def joint_mechanical_power_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """환경별로 선택한 관절의 기계 파워 절댓값을 합산해 반환합니다. 단위는 W입니다."""
+    robot: Articulation = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+
+    applied_torque = robot.actuators.applied_effort.torch[:, joint_ids]
+    joint_velocity = robot.data.joint_vel.torch[:, joint_ids]
+    joint_power = applied_torque * joint_velocity
+
+    # 구동과 제동을 모두 벌점에 포함합니다.
+    return joint_power.abs().sum(dim=1)
+
+    # 구동만 벌점에 포함하려면 위 return을 주석 처리하고 아래 줄을 활성화합니다.
+    # return joint_power.clamp_min(0.0).sum(dim=1)
+
 
 
 """

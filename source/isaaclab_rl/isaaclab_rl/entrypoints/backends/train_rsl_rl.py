@@ -21,15 +21,17 @@ import torch.distributed as dist
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.app import add_launcher_args, launch_simulation, report_activity
-from isaaclab.envs import DirectMARLEnvCfg
+from isaaclab.envs import DirectMARLEnvCfg, VideoRecorderCfg
 from isaaclab.utils import to_dict
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.seed import configure_seed
 from isaaclab.utils.string import list_intersection
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.core.velocity.mdp.curriculum.catalog import terrain_columns_by_name
 from isaaclab_tasks.utils import get_checkpoint_path, resolve_task_config, setup_preset_cli
 
+from ...diagnostics.joint_limit_metrics import JointLimitMetrics
 from ...diagnostics.locomotion_metrics import RslRlLocomotionMetrics
 from ...diagnostics.policy_provenance import write_policy_fingerprint
 from ...diagnostics.rsl_rl_finite_check import RslRlFiniteCheck
@@ -37,6 +39,7 @@ from ...rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from ...utils.curriculum_checkpoint import RslRlCurriculumCheckpoint
 from ...utils.online_curriculum import RslRlOnlineCurriculum
 from ...utils.snapshot_curriculum import RslRlSnapshotCurriculum
+from ...utils.terrain_video import TerrainVideoRecorder, route_terrain_videos_to_wandb
 from ...utils.training_interrupt import training_interrupt_exit
 from ...utils.wandb import announce_new_run, is_wandb_checkpoint, resolve_wandb_checkpoint, resolve_wandb_entity
 from ..common import (
@@ -146,6 +149,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Keep initialized curriculum statistics when resuming; policy and selected optimizer state still load.",
     )
+    parser.add_argument(
+        "--terrain_video",
+        nargs="+",
+        metavar="TERRAIN",
+        help="Record four environments per terrain. Specify two terrains for the combined video.",
+    )
+    parser.add_argument(
+        "--terrain_video_separate",
+        action="store_true",
+        help="Record a separate 2-by-2 video for each named terrain.",
+    )
+    parser.add_argument(
+        "--terrain_video_step_offset",
+        type=int,
+        default=None,
+        help="Number of environment steps to skip before starting the first terrain video.",
+    )
     cli_args.add_rsl_rl_args(parser)
     add_launcher_args(parser)
     remaining_args_env_registration = cli_args.register_external_tasks(argv)
@@ -193,11 +213,70 @@ def run(argv: list[str]) -> None:
         _run(args_cli)
 
 
+def _apply_default_terrain_video(args_cli: argparse.Namespace, env_cfg, agent_cfg) -> None:
+    """Enable separate Go2 stair videos by default for W&B training."""
+    if (
+        args_cli.task != "Isaac-Velocity-Rough-UnitreeGo2"
+        or (args_cli.logger if args_cli.logger is not None else agent_cfg.logger) != "wandb"
+        or args_cli.frontend not in (None, "torch")
+        or args_cli.video
+        or args_cli.terrain_video
+        or env_cfg.video_recorders
+    ):
+        return
+    args_cli.terrain_video = ["pyramid_stairs_inv", "pyramid_stairs"]
+    args_cli.terrain_video_separate = True
+    if args_cli.video_length is None:
+        args_cli.video_length = 200
+    if args_cli.video_interval is None:
+        args_cli.video_interval = 12000
+    if args_cli.terrain_video_step_offset is None:
+        args_cli.terrain_video_step_offset = 12000
+
+
 def _run(args_cli: argparse.Namespace) -> None:
     """Execute RSL-RL training with parsed arguments."""
     with startup_screen(args_cli, num_stages=3) as screen:
         env_cfg, agent_cfg = resolve_task_config(args_cli.task, args_cli.agent)
+        _apply_default_terrain_video(args_cli, env_cfg, agent_cfg)
         pre_launch_video_config(env_cfg, args_cli)
+        rank = int(os.getenv("RANK", "0")) if args_cli.distributed else None
+        terrain_names = args_cli.terrain_video
+        terrain_recorders = []
+        if args_cli.terrain_video_separate and not terrain_names:
+            raise ValueError("--terrain_video_separate requires --terrain_video.")
+        if terrain_names and rank in (None, 0):
+            if args_cli.video or args_cli.frontend not in (None, "torch"):
+                raise ValueError("--terrain_video requires the torch frontend and cannot be combined with --video.")
+            terrain = getattr(env_cfg.scene, "terrain", None)
+            generator = getattr(terrain, "terrain_generator", None)
+            if generator is None or not generator.curriculum:
+                raise ValueError("--terrain_video requires generated terrain with curriculum columns.")
+            terrain_columns = terrain_columns_by_name(generator)
+            separate = args_cli.terrain_video_separate
+            if not separate and len(terrain_names) != 2:
+                raise ValueError("Specify two terrains or use --terrain_video_separate.")
+            if len(set(terrain_names)) != len(terrain_names) or any(name not in terrain_columns for name in terrain_names):
+                raise ValueError(f"Choose distinct terrain names from: {', '.join(terrain_columns)}.")
+            video_length = args_cli.video_length
+            if video_length is None:
+                video_length = round(5.0 / (env_cfg.decimation * env_cfg.sim.dt))
+            terrain_recorder_cfg = VideoRecorderCfg(
+                source="viz:newton_gl",
+                video_length=video_length,
+                video_interval=args_cli.video_interval if args_cli.video_interval is not None else 10_000,
+                frame_stride=min(2, video_length),
+                step_offset=args_cli.terrain_video_step_offset or 0,
+                output_filename_prefix="terrain",
+            )
+            if separate:
+                terrain_recorders = [
+                    ([name], terrain_recorder_cfg.replace(output_filename_prefix=f"terrain_{name}"))
+                    for name in terrain_names
+                ]
+            else:
+                terrain_recorders = [(terrain_names, terrain_recorder_cfg)]
+            env_cfg.video_recorders.extend(cfg for _, cfg in terrain_recorders)
         screen.stage("Launching simulation")
         with launch_simulation(env_cfg, args_cli), contextlib.ExitStack() as cleanup:
             show_run_summary(screen, args_cli, env_cfg, library="rsl_rl", action="train")
@@ -205,7 +284,6 @@ def _run(args_cli: argparse.Namespace) -> None:
             apply_env_overrides(args_cli, env_cfg)
             if args_cli.max_iterations is not None:
                 agent_cfg.max_iterations = args_cli.max_iterations
-            rank = int(os.getenv("RANK", "0")) if args_cli.distributed else None
             if rank is not None:
                 agent_cfg.seed += rank
             env_cfg.seed = agent_cfg.seed
@@ -226,6 +304,13 @@ def _run(args_cli: argparse.Namespace) -> None:
             resume_path = _resolve_checkpoint(args_cli, agent_cfg, log_root_path)
             env_cfg.log_dir = rank_dir
             apply_video_recording(env_cfg, rank_dir, args_cli)
+            if terrain_recorders:
+                for names, cfg in terrain_recorders:
+                    parts = names if args_cli.terrain_video_separate else []
+                    cfg.output_dir = os.path.join(rank_dir, "videos", "train", *parts)
+                for visualizer in env_cfg.sim.visualizer_cfgs:
+                    if visualizer.backend.visualizer_type == "newton_gl" and visualizer.headless:
+                        visualizer.window.size = (384, 216)
 
             screen.stage("Creating environment")
             env = create_isaaclab_env(
@@ -235,6 +320,12 @@ def _run(args_cli: argparse.Namespace) -> None:
                 convert_marl_to_single_agent=isinstance(env_cfg, DirectMARLEnvCfg),
             )
             cleanup.callback(lambda: close_env(env))
+            if terrain_recorders:
+                recording_env = env.unwrapped
+                recording_env.video_recorders[-len(terrain_recorders):] = [
+                    TerrainVideoRecorder(cfg, recording_env, names, terrain_columns)
+                    for names, cfg in terrain_recorders
+                ]
             env = wrap_sensor_capture(env, rank_dir, args_cli)
 
             screen.stage("Preparing agent")
@@ -250,6 +341,10 @@ def _run(args_cli: argparse.Namespace) -> None:
             else:
                 raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
             report_activity(None)
+            if terrain_recorders and args_cli.terrain_video_separate and agent_cfg.logger == "wandb":
+                route_terrain_videos_to_wandb(
+                    runner.logger, {cfg.output_dir: names[0] for names, cfg in terrain_recorders}
+                )
 
             cleanup.enter_context(RslRlCurriculumCheckpoint(runner, restore_curriculum=not args_cli.reset_curriculum))
 
@@ -289,11 +384,17 @@ def _run(args_cli: argparse.Namespace) -> None:
                 else contextlib.nullcontext()
             )
             locomotion_metrics = RslRlLocomotionMetrics(runner)
+            joint_limits = (
+                JointLimitMetrics(args_cli.task, runner)
+                if args_cli.task == "Isaac-Velocity-Rough-UnitreeGo2" and isinstance(runner, OnPolicyRunner)
+                else contextlib.nullcontext()
+            )
 
             @contextlib.contextmanager
             def probe_context():
                 with (
                     locomotion_metrics.suspend(),
+                    joint_limits.suspend() if isinstance(joint_limits, JointLimitMetrics) else contextlib.nullcontext(),
                     finite_check.snapshot_probe()
                     if isinstance(finite_check, RslRlFiniteCheck)
                     else contextlib.nullcontext(),
@@ -310,6 +411,7 @@ def _run(args_cli: argparse.Namespace) -> None:
                 contextlib.redirect_stdout(_TransitionMetricsConsole(sys.stdout)),
                 finite_check,
                 locomotion_metrics,
+                joint_limits,
                 RslRlOnlineCurriculum(runner, resumed=resume_path is not None),
                 snapshot_curriculum,
             ):

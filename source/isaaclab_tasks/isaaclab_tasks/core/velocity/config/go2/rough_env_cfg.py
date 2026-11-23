@@ -7,6 +7,7 @@
 
 import math
 
+from isaaclab.envs.mdp import joint_pos_out_of_limit
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
@@ -218,13 +219,14 @@ class UnitreeGo2Rewards(RewardsCfg):
 
 @configclass
 class UnitreeGo2TerminationsCfg(TerminationsCfg):
-    """Go2의 몸통 기울기가 90도를 초과하면 속도 추종 실패로 종료함.
+    """Go2 평지·험지 환경에 공통으로 적용하는 종료 조건.
 
-    몸통 +Z축과 월드 +Z축 사이의 전체 기울기를 사용하며 접촉 여부와 독립적으로 평가함.
-    평지·험지에 공통 적용하며, 기울기가 큰 상태로 action을 계속 출력하는 구간을 차단함.
+    몸통 +Z축과 월드 +Z축 사이의 기울기가 90도를 초과하면 접촉 여부와 관계없이 종료함.
+    관절 하나라도 로봇 모델의 물리적 위치 하한이나 상한을 벗어나면 종료함.
     """
 
     bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": math.radians(90.0)})
+    joint_pos_out_of_limit = DoneTerm(func=joint_pos_out_of_limit, params={"use_soft_limits": False})
 
 
 @configclass
@@ -313,7 +315,7 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.collisions.weight = -1.0  # -1.0 에서 변경
         # --> collision = 0.0 변경 시, iteration time이 커지는 경향 발생.
         
-        self.rewards.dof_pos_limits.weight = -10.0
+        self.rewards.dof_pos_limits.weight = -30.0
         self.rewards.dof_vel_limits.weight = 0.0
         self.rewards.dof_acc_l2.weight = -4.5e-7  # -4.5e-7 에서 변경
         self.rewards.dof_torques_l2.weight = -0.0001
